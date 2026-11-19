@@ -90,9 +90,16 @@ class SettingController extends Controller
 
     public function toggleUserActive(User $user)
     {
-        $user->update(['is_active' => ! $user->is_active]);
-        $state = $user->is_active ? 'diaktifkan' : 'dinonaktifkan';
-        AuditLogService::log('Pengaturan', 'TOGGLE_USER', $user->email, "Akun {$user->name} {$state}");
+        $newState = ! $user->is_active;
+        $user->update(['is_active' => $newState]);
+
+        // Bagian 5.1 & S-15: Saat akun dinonaktifkan, cabut seluruh sesi aktif pengguna tersebut di tabel sessions
+        if (! $newState) {
+            \Illuminate\Support\Facades\DB::table('sessions')->where('user_id', $user->id)->delete();
+        }
+
+        $state = $newState ? 'diaktifkan' : 'dinonaktifkan';
+        AuditLogService::log('Pengaturan', 'TOGGLE_USER', $user->email, "Akun {$user->name} {$state} dan seluruh sesi aktif dicabut");
         return back()->with('success', "Status akun {$user->name} berhasil {$state}.");
     }
 

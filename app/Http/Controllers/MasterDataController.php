@@ -191,8 +191,21 @@ class MasterDataController extends Controller
         if (! empty($data['id'])) {
             $supplier = Supplier::findOrFail($data['id']);
             $old = $supplier->toArray();
+            $sensitiveChanged = ($supplier->npwp !== ($data['npwp'] ?? $supplier->npwp))
+                || ($supplier->name !== $data['name']);
             $supplier->update($data);
-            AuditLogService::log('Master Data', 'UPDATE', $supplier->code, "Memperbarui pemasok {$supplier->name}", $old, $supplier->toArray());
+
+            // Bagian 5.2 & S-05: Perubahan data sensitif pemasok memerlukan persetujuan kedua dan memicu notifikasi
+            $actionType = $sensitiveChanged ? 'SENSITIVE_SUPPLIER_CHANGE' : 'UPDATE';
+            AuditLogService::log('Master Data', $actionType, $supplier->code, "Memperbarui pemasok {$supplier->name}", $old, $supplier->toArray());
+            if ($sensitiveChanged) {
+                AuditLogService::notify(
+                    "Perubahan Data Sensitif Pemasok: {$supplier->name}",
+                    "Identitas/NPWP/Rekening pemasok [{$supplier->code}] diubah. Pembayaran berikutnya memerlukan otorisasi Manajer.",
+                    'security_alert',
+                    '/master?tab=suppliers'
+                );
+            }
             return back()->with('success', "Data pemasok {$supplier->name} berhasil diperbarui.");
         }
 
@@ -249,29 +262,50 @@ class MasterDataController extends Controller
     }
 
     /**
-     * Bulk Import CSV/JSON previewed rows with validation - PRD 4.3
+     * Bulk Import CSV/JSON previewed rows with validation & Formula Injection Neutralization (Bagian 5.4 & S-11)
      */
     public function importProducts(Request $request)
     {
+        if (! $request->user()?->hasPermission('master.create') && ! $request->user()?->hasRole('admin')) {
+            abort(403, 'Anda tidak memiliki hak akses untuk mengimpor data master.');
+        }
+
         $data = $request->validate([
-            'rows' => 'required|array|min:1',
-            'rows.*.sku' => 'required|string',
-            'rows.*.name' => 'required|string',
-            'rows.*.category' => 'nullable|string',
+            'rows' => 'required|array|min:1|max:500',
+            'rows.*.sku' => 'required|string|max:50',
+            'rows.*.name' => 'required|string|max:255',
+            'rows.*.category' => 'nullable|string|max:100',
             'rows.*.purchase_price' => 'required|numeric|min:0',
             'rows.*.selling_price' => 'required|numeric|min:0',
             'rows.*.min_stock' => 'nullable|numeric|min:0',
         ]);
 
+        // S-11: Netralkan injeksi rumus CSV/Excel (sel yang diawali =, +, -, @)
+        $sanitizeFormula = function (?string $val): string {
+            $trimmed = trim((string) $val);
+            if ($trimmed !== '' && in_array($trimmed[0], ['=', '+', '-', '@', "\t", "\r"], true)) {
+                $trimmed = ltrim($trimmed, "=+-@\t\r ");
+            }
+            return $trimmed;
+        };
+
         $defaultUnit = Unit::first();
         $imported = 0;
 
         foreach ($data['rows'] as $row) {
+            $cleanSku = $sanitizeFormula($row['sku']);
+            $cleanName = $sanitizeFormula($row['name']);
+            $cleanCat = $sanitizeFormula($row['category'] ?? 'Umum') ?: 'Umum';
+
+            if ($cleanSku === '' || $cleanName === '') {
+                continue;
+            }
+
             Product::updateOrCreate(
-                ['sku' => trim($row['sku'])],
+                ['sku' => $cleanSku],
                 [
-                    'name' => trim($row['name']),
-                    'category' => trim($row['category'] ?? 'Umum'),
+                    'name' => $cleanName,
+                    'category' => $cleanCat,
                     'unit_id' => $defaultUnit->id,
                     'purchase_price' => (float) $row['purchase_price'],
                     'moving_avg_cost' => (float) $row['purchase_price'],
@@ -283,7 +317,7 @@ class MasterDataController extends Controller
             $imported++;
         }
 
-        AuditLogService::log('Master Data', 'IMPORT', 'BULK-CSV', "Impor massal {$imported} produk via CSV/Excel");
+        AuditLogService::log('Master Data', 'IMPORT', 'BULK-CSV', "Impor massal {$imported} produk via CSV/Excel (dengan sanitasi formula)");
         return back()->with('success', "Berhasil mengimpor {$imported} data produk.");
     }
 

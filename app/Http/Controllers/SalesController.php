@@ -370,7 +370,7 @@ class SalesController extends Controller
     }
 
     /**
-     * Catat Pembayaran Penerimaan (mendukung pembayaran sebagian / pelunasan penuh) - PRD 4.4
+     * Catat Pembayaran Penerimaan dengan Lock Atomik (S-12: mencegah pembayaran ganda serentak pada faktur yang sama)
      */
     public function recordReceipt(Request $request, SalesInvoice $salesInvoice)
     {
@@ -382,26 +382,26 @@ class SalesController extends Controller
             'reference_note' => 'nullable|string',
         ]);
 
-        if ($salesInvoice->balance_due <= 0) {
-            return back()->with('error', 'Faktur ini sudah lunas.');
-        }
+        return DB::transaction(function () use ($salesInvoice, $data) {
+            $lockedInvoice = SalesInvoice::with(['customer', 'salesOrder'])->lockForUpdate()->findOrFail($salesInvoice->id);
 
-        $payAmount = min((float) $data['amount'], (float) $salesInvoice->balance_due);
+            if ($lockedInvoice->balance_due <= 0) {
+                throw new \RuntimeException('Faktur penjualan ini sudah lunas (pembayaran ganda ditolak).');
+            }
 
-        return DB::transaction(function () use ($salesInvoice, $data, $payAmount) {
-            $salesInvoice->load(['customer', 'salesOrder']);
+            $payAmount = min((float) $data['amount'], (float) $lockedInvoice->balance_due);
             $bank = BankAccount::with('account')->findOrFail($data['bank_account_id']);
             $rcpNumber = DocumentNumberService::generate('RCP', 'RCP', $data['receipt_date']);
 
             $receipt = Receipt::create([
                 'receipt_number' => $rcpNumber,
-                'sales_invoice_id' => $salesInvoice->id,
-                'customer_id' => $salesInvoice->customer_id,
+                'sales_invoice_id' => $lockedInvoice->id,
+                'customer_id' => $lockedInvoice->customer_id,
                 'bank_account_id' => $bank->id,
                 'receipt_date' => $data['receipt_date'],
                 'payment_method' => $data['payment_method'],
                 'amount' => $payAmount,
-                'reference_note' => $data['reference_note'],
+                'reference_note' => $data['reference_note'] ?? null,
                 'status' => 'Selesai',
                 'created_by' => Auth::id(),
             ]);
@@ -409,10 +409,10 @@ class SalesController extends Controller
             $journal = AccountingService::createJournal(
                 $data['receipt_date'],
                 'SALES',
-                "Penerimaan Pembayaran Piutang {$rcpNumber} atas Faktur {$salesInvoice->invoice_number}",
+                "Penerimaan Pembayaran Piutang {$rcpNumber} atas Faktur {$lockedInvoice->invoice_number}",
                 [
                     ['account_id' => $bank->account_id, 'debit' => $payAmount, 'credit' => 0, 'description' => "Penerimaan {$bank->name} ({$rcpNumber})"],
-                    ['account_code' => '1104', 'debit' => 0, 'credit' => $payAmount, 'description' => "Pelunasan Piutang {$salesInvoice->invoice_number}"],
+                    ['account_code' => '1104', 'debit' => 0, 'credit' => $payAmount, 'description' => "Pelunasan Piutang {$lockedInvoice->invoice_number}"],
                 ],
                 $rcpNumber,
                 Receipt::class,
@@ -421,21 +421,21 @@ class SalesController extends Controller
 
             $receipt->update(['journal_id' => $journal->id]);
 
-            $newPaid = $salesInvoice->paid_amount + $payAmount;
-            $newBalance = max(0, $salesInvoice->grand_total - $newPaid);
+            $newPaid = $lockedInvoice->paid_amount + $payAmount;
+            $newBalance = max(0, $lockedInvoice->grand_total - $newPaid);
             $newStatus = $newBalance <= 0.01 ? 'Selesai' : 'Sebagian';
 
-            $salesInvoice->update([
+            $lockedInvoice->update([
                 'paid_amount' => $newPaid,
                 'balance_due' => $newBalance,
                 'status' => $newStatus,
             ]);
 
-            if ($newStatus === 'Selesai' && $salesInvoice->salesOrder) {
-                $salesInvoice->salesOrder->update(['status' => 'Selesai']);
+            if ($newStatus === 'Selesai' && $lockedInvoice->salesOrder) {
+                $lockedInvoice->salesOrder->update(['status' => 'Selesai']);
             }
 
-            AuditLogService::log('Penjualan', 'RECEIPT', $rcpNumber, "Mencatat penerimaan piutang Rp " . number_format($payAmount, 0, ',', '.') . " untuk faktur {$salesInvoice->invoice_number}");
+            AuditLogService::log('Penjualan', 'RECEIPT', $rcpNumber, "Mencatat penerimaan piutang Rp " . number_format($payAmount, 0, ',', '.') . " untuk faktur {$lockedInvoice->invoice_number}");
             return back()->with('success', "Pembayaran {$rcpNumber} sebesar Rp " . number_format($payAmount, 0, ',', '.') . " berhasil dicatat & dijurnal otomatis.");
         });
     }

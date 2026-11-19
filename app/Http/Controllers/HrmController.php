@@ -23,35 +23,57 @@ class HrmController extends Controller
 {
     public function index(Request $request)
     {
+        $user = $request->user();
+        $canViewSensitivePayroll = $user && ($user->hasRole('admin') || $user->hasRole('manager') || $user->hasRole('hr') || $user->hasRole('finance'));
+
+        // Bagian 5.7 & S-14: Untuk peran terbatas (employee/staf biasa), jangan kirim kolom sensitif (gaji, rekening, NPWP) ke frontend Inertia
         $employees = Employee::with(['attendances' => fn ($q) => $q->latest('work_date')->limit(10), 'leaves', 'payslips.payrollRun'])
+            ->when(! $canViewSensitivePayroll, fn ($q) => $q->where('user_id', $user?->id))
             ->orderBy('emp_code')
-            ->get();
+            ->get()
+            ->map(function ($emp) use ($canViewSensitivePayroll, $user) {
+                $arr = $emp->toArray();
+                if (! $canViewSensitivePayroll && (int) $emp->user_id !== (int) $user?->id) {
+                    unset($arr['base_salary'], $arr['transport_allowance'], $arr['meal_allowance'], $arr['position_allowance'], $arr['bank_account_number'], $arr['npwp'], $arr['nik']);
+                }
+                return $arr;
+            });
 
         $attendances = Attendance::with('employee')
+            ->when(! $canViewSensitivePayroll, fn ($q) => $q->whereHas('employee', fn ($eq) => $eq->where('user_id', $user?->id)))
             ->latest('work_date')
             ->limit(100)
             ->get();
 
         $leaves = Leave::with(['employee', 'approver'])
+            ->when(! $canViewSensitivePayroll, fn ($q) => $q->whereHas('employee', fn ($eq) => $eq->where('user_id', $user?->id)))
             ->latest()
             ->get();
 
-        $payrollRuns = PayrollRun::with(['payslips.employee', 'journal.lines.account', 'creator', 'approver'])
-            ->orderByDesc('period_month')
-            ->get();
+        $payrollRuns = $canViewSensitivePayroll
+            ? PayrollRun::with(['payslips.employee', 'journal.lines.account', 'creator', 'approver'])
+                ->orderByDesc('period_month')
+                ->get()
+            : collect();
 
         return Inertia::render('Hrm/Index', [
             'employees' => $employees,
             'attendances' => $attendances,
             'leaves' => $leaves,
             'payrollRuns' => $payrollRuns,
-            'salaryComponents' => SalaryComponent::orderBy('type')->orderBy('code')->get(),
-            'bankAccounts' => BankAccount::where('is_active', true)->get(),
+            'salaryComponents' => $canViewSensitivePayroll ? SalaryComponent::orderBy('type')->orderBy('code')->get() : collect(),
+            'bankAccounts' => $canViewSensitivePayroll ? BankAccount::where('is_active', true)->get() : collect(),
         ]);
     }
 
     public function storeEmployee(Request $request)
     {
+        // Bagian 5.2 & S-02: Hanya peran HR / Manager / Admin yang berhak mengubah master karyawan dan gaji
+        $user = $request->user();
+        if (! $user || (! $user->hasRole('admin') && ! $user->hasRole('hr') && ! $user->hasRole('manager'))) {
+            abort(403, 'Anda tidak memiliki hak akses untuk mengubah data karyawan dan gaji.');
+        }
+
         $data = $request->validate([
             'id' => 'nullable|integer',
             'emp_code' => 'required|string|max:30',
@@ -76,9 +98,30 @@ class HrmController extends Controller
 
         if (! empty($data['id'])) {
             $emp = Employee::findOrFail($data['id']);
+            // Bagian 4.3 #5 & 5.2: Pemisahan tugas — pengguna tidak boleh mengubah gaji/tunjangan/rekening miliknya sendiri
+            if ($emp->user_id && (int) $emp->user_id === (int) $request->user()?->id && ! $request->user()?->hasRole('admin')) {
+                abort(403, 'Pelanggaran Pemisahan Tugas (SoD): Anda tidak diizinkan mengubah gaji, tunjangan, atau nomor rekening milik Anda sendiri.');
+            }
             $old = $emp->toArray();
+            $sensitiveSalaryChanged = (float) $emp->base_salary !== (float) $data['base_salary']
+                || $emp->bank_account_number !== ($data['bank_account_number'] ?? $emp->bank_account_number);
             $emp->update($data);
-            AuditLogService::log('SDM & Payroll', 'UPDATE_EMPLOYEE', $emp->emp_code, "Memperbarui data karyawan {$emp->name}", $old, $emp->toArray());
+            AuditLogService::log(
+                'SDM & Payroll',
+                $sensitiveSalaryChanged ? 'SENSITIVE_SALARY_BANK_CHANGE' : 'UPDATE_EMPLOYEE',
+                $emp->emp_code,
+                "Memperbarui data karyawan {$emp->name}",
+                $old,
+                $emp->toArray()
+            );
+            if ($sensitiveSalaryChanged) {
+                AuditLogService::notify(
+                    "Perubahan Gaji / Rekening Karyawan: {$emp->name}",
+                    "Data gaji pokok atau nomor rekening bank [{$emp->emp_code}] telah diubah oleh {$request->user()?->name}.",
+                    'security_alert',
+                    '/hrm'
+                );
+            }
             return back()->with('success', "Data karyawan {$emp->name} berhasil diperbarui.");
         }
 
@@ -222,7 +265,8 @@ class HrmController extends Controller
     public function portal(Request $request)
     {
         $user = $request->user();
-        $employee = Employee::where('user_id', $user->id)->first() ?: Employee::first();
+        $canViewAll = $user && ($user->hasRole('admin') || $user->hasRole('hr') || $user->hasRole('manager'));
+        $employee = Employee::where('user_id', $user->id)->first() ?: ($canViewAll ? Employee::first() : null);
 
         $payslips = $employee
             ? Payslip::with(['payrollRun', 'employee'])->where('employee_id', $employee->id)->latest()->get()
@@ -234,15 +278,25 @@ class HrmController extends Controller
 
         return Inertia::render('Hrm/Portal', [
             'employee' => $employee,
-            'allEmployees' => Employee::orderBy('name')->get(['id', 'emp_code', 'name', 'department', 'position']),
+            'allEmployees' => $canViewAll
+                ? Employee::orderBy('name')->get(['id', 'emp_code', 'name', 'department', 'position'])
+                : ($employee ? collect([$employee->only(['id', 'emp_code', 'name', 'department', 'position'])]) : collect()),
             'payslips' => $payslips,
             'leaves' => $leaves,
         ]);
     }
 
-    public function printPayslip(Payslip $payslip)
+    public function printPayslip(Request $request, Payslip $payslip)
     {
         $payslip->load(['employee', 'payrollRun']);
+
+        // Bagian 4.3 #6, 5.2, S-01: Pencegahan IDOR pada Slip Gaji — Pengguna biasa hanya boleh melihat slip gajinya sendiri
+        $user = $request->user();
+        $canViewAllPayroll = $user && ($user->hasRole('admin') || $user->hasRole('manager') || $user->hasRole('hr') || $user->hasRole('finance'));
+        if (! $canViewAllPayroll && (int) $payslip->employee?->user_id !== (int) $user?->id) {
+            AuditLogService::log('Keamanan', 'IDOR_BLOCKED', $payslip->payslip_number, "Percobaan akses tidak sah (IDOR) ke slip gaji {$payslip->payslip_number} oleh {$user?->email}");
+            abort(403, 'Akses Ditolak (IDOR S-01): Anda tidak berhak mengakses slip gaji milik karyawan lain.');
+        }
 
         return Inertia::render('Hrm/PayslipPrint', [
             'payslip' => $payslip,

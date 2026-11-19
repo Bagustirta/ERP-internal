@@ -15,6 +15,8 @@ use App\Models\User;
 use App\Services\AuditLogService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Str;
 use Inertia\Inertia;
 
 class AuthController extends Controller
@@ -41,17 +43,51 @@ class AuthController extends Controller
             'password' => ['required'],
         ]);
 
+        // Bagian 5.1 & S-09: Pembatasan percobaan login (rate limiting) & penguncian sementara + pencatatan log audit
+        $throttleKey = Str::transliterate(Str::lower($credentials['email']).'|'.$request->ip());
+        if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+            $seconds = RateLimiter::availableIn($throttleKey);
+            AuditLogService::log(
+                'Autentikasi',
+                'LOGIN_LOCKED',
+                $credentials['email'],
+                "Percobaan login diblokir sementara ({$seconds} detik) karena terlalu banyak kegagalan sandi dari IP {$request->ip()}"
+            );
+            AuditLogService::notify(
+                'Peringatan Keamanan: Percobaan Login Berulang',
+                "Terdeteksi lebih dari 5 kegagalan login untuk {$credentials['email']} dari IP {$request->ip()}.",
+                'security_alert',
+                '/settings'
+            );
+
+            return back()->withErrors([
+                'email' => "Terlalu banyak percobaan login gagal. Silakan coba lagi dalam {$seconds} detik.",
+            ])->onlyInput('email');
+        }
+
         $user = User::where('email', $credentials['email'])->first();
         if ($user && ! $user->is_active) {
-            return back()->withErrors(['email' => 'Akun pengguna ini telah dinonaktifkan oleh Admin Sistem.']);
+            RateLimiter::hit($throttleKey, 300);
+            AuditLogService::log('Autentikasi', 'LOGIN_FAILED', $credentials['email'], 'Percobaan login pada akun nonaktif');
+            return back()->withErrors(['email' => 'Email atau kata sandi tidak sesuai.'])->onlyInput('email');
         }
 
         if (Auth::attempt($credentials, $request->boolean('remember'))) {
+            RateLimiter::clear($throttleKey);
             $request->session()->regenerate();
             AuditLogService::log('Autentikasi', 'LOGIN', null, 'Pengguna berhasil masuk ke sistem ERP');
             return redirect()->intended('/dashboard')->with('success', 'Selamat datang kembali, ' . Auth::user()->name);
         }
 
+        RateLimiter::hit($throttleKey, 300);
+        AuditLogService::log(
+            'Autentikasi',
+            'LOGIN_FAILED',
+            $credentials['email'],
+            "Kegagalan login (sandi salah) untuk {$credentials['email']} dari IP {$request->ip()}"
+        );
+
+        // Pesan error generik agar tidak membocorkan apakah akun/email ada (Bagian 5.1)
         return back()->withErrors([
             'email' => 'Email atau kata sandi tidak sesuai.',
         ])->onlyInput('email');

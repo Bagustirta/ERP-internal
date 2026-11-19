@@ -111,11 +111,29 @@ class PurchasingController extends Controller
             }
 
             $grandTotal = $subtotal + $taxTotal;
-            $requiresApproval = $grandTotal >= $threshold || $data['doc_type'] === 'PR';
+
+            // Bagian 4.3 #4, 5.2, S-04: Deteksi pemecahan transaksi (split transaction) di bawah batas persetujuan
+            // Jika total kumulatif PO ke pemasok yang sama pada tanggal yang sama + PO baru >= threshold, wajib masuk antrean persetujuan
+            $cumulativeTodayForSupplier = (float) PurchaseOrder::where('supplier_id', $data['supplier_id'])
+                ->where('order_date', $data['order_date'])
+                ->where('status', '!=', 'Batal')
+                ->sum('grand_total');
+            $isSplitAboveThreshold = ($cumulativeTodayForSupplier + $grandTotal) >= $threshold && $cumulativeTodayForSupplier > 0;
+
+            $requiresApproval = $grandTotal >= $threshold || $data['doc_type'] === 'PR' || $isSplitAboveThreshold;
 
             $status = 'Draft';
             if ($data['submit_action'] === 'submit') {
                 $status = $requiresApproval ? 'Diajukan' : 'Disetujui';
+            }
+
+            if ($isSplitAboveThreshold) {
+                AuditLogService::log(
+                    'Keamanan',
+                    'ANOMALY_SPLIT_PO',
+                    'SUP-' . $data['supplier_id'],
+                    "Terdeteksi indikasi pemecahan PO pada tanggal {$data['order_date']} dengan akumulasi Rp " . number_format($cumulativeTodayForSupplier + $grandTotal, 0, ',', '.')
+                );
             }
 
             $docType = $data['doc_type'];
@@ -340,7 +358,7 @@ class PurchasingController extends Controller
     }
 
     /**
-     * Pembayaran Hutang Pemasok - PRD 4.5
+     * Pembayaran Hutang Pemasok dengan Lock Atomik & Deteksi Anomali Perubahan Rekening (S-05 & S-12)
      */
     public function recordPayment(Request $request, PurchaseInvoice $purchaseInvoice)
     {
@@ -352,26 +370,37 @@ class PurchasingController extends Controller
             'reference_note' => 'nullable|string',
         ]);
 
-        if ($purchaseInvoice->balance_due <= 0) {
-            return back()->with('error', 'Faktur pemasok ini sudah lunas.');
-        }
+        return DB::transaction(function () use ($purchaseInvoice, $data) {
+            // S-12: Lock baris faktur pemasok secara atomik (SELECT ... FOR UPDATE) untuk mencegah pembayaran ganda serentak
+            $lockedInvoice = PurchaseInvoice::with(['supplier', 'purchaseOrder'])->lockForUpdate()->findOrFail($purchaseInvoice->id);
 
-        $payAmount = min((float) $data['amount'], (float) $purchaseInvoice->balance_due);
+            if ($lockedInvoice->balance_due <= 0) {
+                throw new \RuntimeException('Faktur pemasok ini sudah lunas (pembayaran ganda ditolak).');
+            }
 
-        return DB::transaction(function () use ($purchaseInvoice, $data, $payAmount) {
-            $purchaseInvoice->load(['supplier', 'purchaseOrder']);
+            // S-05: Periksa apakah pemasok mengalami perubahan data sensitif (rekening/NPWP) yang belum mendapatkan persetujuan kedua
+            $recentUnapprovedSupplierChange = \App\Models\AuditLog::where('module', 'Master Data')
+                ->where('action', 'SENSITIVE_SUPPLIER_CHANGE')
+                ->where('document_number', $lockedInvoice->supplier?->code)
+                ->exists();
+
+            if ($recentUnapprovedSupplierChange && ! Auth::user()?->hasRole('admin') && ! Auth::user()?->hasRole('manager')) {
+                abort(403, 'Keamanan Pembayaran (S-05): Data rekening/identitas pemasok baru saja diubah. Pembayaran memerlukan persetujuan kedua dari Manajer/Direksi.');
+            }
+
+            $payAmount = min((float) $data['amount'], (float) $lockedInvoice->balance_due);
             $bank = BankAccount::findOrFail($data['bank_account_id']);
             $payNumber = DocumentNumberService::generate('PAY', 'PAY', $data['payment_date']);
 
             $payment = Payment::create([
                 'payment_number' => $payNumber,
-                'purchase_invoice_id' => $purchaseInvoice->id,
-                'supplier_id' => $purchaseInvoice->supplier_id,
+                'purchase_invoice_id' => $lockedInvoice->id,
+                'supplier_id' => $lockedInvoice->supplier_id,
                 'bank_account_id' => $bank->id,
                 'payment_date' => $data['payment_date'],
                 'payment_method' => $data['payment_method'],
                 'amount' => $payAmount,
-                'reference_note' => $data['reference_note'],
+                'reference_note' => $data['reference_note'] ?? null,
                 'status' => 'Selesai',
                 'created_by' => Auth::id(),
             ]);
@@ -379,9 +408,9 @@ class PurchasingController extends Controller
             $journal = AccountingService::createJournal(
                 $data['payment_date'],
                 'PURCHASING',
-                "Pembayaran Hutang {$payNumber} ke {$purchaseInvoice->supplier?->name}",
+                "Pembayaran Hutang {$payNumber} ke {$lockedInvoice->supplier?->name}",
                 [
-                    ['account_code' => '2101', 'debit' => $payAmount, 'credit' => 0, 'description' => "Pelunasan Hutang {$purchaseInvoice->invoice_number}"],
+                    ['account_code' => '2101', 'debit' => $payAmount, 'credit' => 0, 'description' => "Pelunasan Hutang {$lockedInvoice->invoice_number}"],
                     ['account_id' => $bank->account_id, 'debit' => 0, 'credit' => $payAmount, 'description' => "Pengeluaran {$bank->name} ({$payNumber})"],
                 ],
                 $payNumber,
@@ -391,21 +420,21 @@ class PurchasingController extends Controller
 
             $payment->update(['journal_id' => $journal->id]);
 
-            $newPaid = $purchaseInvoice->paid_amount + $payAmount;
-            $newBalance = max(0, $purchaseInvoice->grand_total - $newPaid);
+            $newPaid = $lockedInvoice->paid_amount + $payAmount;
+            $newBalance = max(0, $lockedInvoice->grand_total - $newPaid);
             $newStatus = $newBalance <= 0.01 ? 'Selesai' : 'Sebagian';
 
-            $purchaseInvoice->update([
+            $lockedInvoice->update([
                 'paid_amount' => $newPaid,
                 'balance_due' => $newBalance,
                 'status' => $newStatus,
             ]);
 
-            if ($newStatus === 'Selesai' && $purchaseInvoice->purchaseOrder) {
-                $purchaseInvoice->purchaseOrder->update(['status' => 'Selesai']);
+            if ($newStatus === 'Selesai' && $lockedInvoice->purchaseOrder) {
+                $lockedInvoice->purchaseOrder->update(['status' => 'Selesai']);
             }
 
-            AuditLogService::log('Pembelian', 'PAYMENT', $payNumber, "Membayar hutang Rp " . number_format($payAmount, 0, ',', '.') . " untuk faktur {$purchaseInvoice->invoice_number}");
+            AuditLogService::log('Pembelian', 'PAYMENT', $payNumber, "Membayar hutang Rp " . number_format($payAmount, 0, ',', '.') . " untuk faktur {$lockedInvoice->invoice_number}");
             return back()->with('success', "Pembayaran Hutang {$payNumber} sebesar Rp " . number_format($payAmount, 0, ',', '.') . " berhasil dicatat & dijurnal.");
         });
     }

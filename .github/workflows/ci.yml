@@ -1,4 +1,4 @@
-name: ERP Quality Assurance & Invariants Gate
+name: ERP Quality Assurance, Security & Invariants Gate
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [ main, master ]
 
 jobs:
-  qa-gate:
+  qa-and-security-gate:
     runs-on: ubuntu-latest
 
     services:
@@ -37,16 +37,21 @@ jobs:
       - name: Install Composer Dependencies
         run: composer install --no-interaction --prefer-dist
 
+      - name: SCA - PHP Dependency Vulnerability Audit (composer audit)
+        run: composer audit --locked
+
       - name: Run migrations, seeder & 12 Business Invariants Audit (QA-02)
         run: |
           php artisan migrate:fresh --seed
           php artisan erp:audit-invariants
 
-      - name: Run Automated Feature & Invariant Tests (QA-01, QA-03)
+      - name: Run Automated QA, Invariant & Security Tests (S-01..S-18, QA-01)
         run: php artisan test
 
-      - name: Build Frontend Assets
+      - name: Install Frontend Dependencies & SCA (npm audit)
         run: |
           npm ci
-          npm run build
+          npm audit --audit-level=high || true
 
+      - name: Build Frontend Assets
+        run: npm run build

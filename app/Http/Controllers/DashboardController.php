@@ -417,6 +417,9 @@ class DashboardController extends Controller
         switch ($category) {
             case 'SO':
                 $so = SalesOrder::findOrFail($docId);
+                if ($isApprove && $so->created_by && (int) $so->created_by === (int) $user->id) {
+                    abort(403, 'Pelanggaran Pemisahan Tugas (SoD): Pembuat dokumen tidak boleh menyetujui dokumennya sendiri.');
+                }
                 $so->update([
                     'status' => $newStatus,
                     'approved_by' => $user->id,
@@ -428,6 +431,9 @@ class DashboardController extends Controller
 
             case 'PO':
                 $po = PurchaseOrder::findOrFail($docId);
+                if ($isApprove && $po->created_by && (int) $po->created_by === (int) $user->id) {
+                    abort(403, 'Pelanggaran Pemisahan Tugas (SoD): Pembuat dokumen tidak boleh menyetujui dokumennya sendiri.');
+                }
                 $po->update([
                     'status' => $newStatus,
                     'approved_by' => $user->id,
@@ -439,6 +445,9 @@ class DashboardController extends Controller
 
             case 'OPNAME':
                 $opname = StockOpname::with('items.product')->findOrFail($docId);
+                if ($isApprove && $opname->created_by && (int) $opname->created_by === (int) $user->id) {
+                    abort(403, 'Pelanggaran Pemisahan Tugas (SoD): Pembuat dokumen tidak boleh menyetujui dokumennya sendiri.');
+                }
                 if ($isApprove) {
                     $totalDiffValue = 0;
                     foreach ($opname->items as $item) {
@@ -502,7 +511,10 @@ class DashboardController extends Controller
                 break;
 
             case 'LEAVE':
-                $leave = Leave::findOrFail($docId);
+                $leave = Leave::with('employee')->findOrFail($docId);
+                if ($isApprove && $leave->employee && (int) $leave->employee->user_id === (int) $user->id) {
+                    abort(403, 'Pelanggaran Pemisahan Tugas (SoD): Pembuat pengajuan cuti tidak boleh menyetujui cutinya sendiri.');
+                }
                 $leave->update([
                     'status' => $newStatus,
                     'approved_by' => $user->id,
@@ -514,6 +526,9 @@ class DashboardController extends Controller
 
             case 'PAYROLL':
                 $payroll = PayrollRun::findOrFail($docId);
+                if ($isApprove && $payroll->created_by && (int) $payroll->created_by === (int) $user->id) {
+                    abort(403, 'Pelanggaran Pemisahan Tugas (SoD): Pembuat perhitungan payroll tidak boleh menyetujui payroll-nya sendiri.');
+                }
                 if ($isApprove) {
                     PayrollService::approveAndPostJournal($payroll);
                 } else {
