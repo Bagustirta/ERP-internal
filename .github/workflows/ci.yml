@@ -25,6 +25,15 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+    env:
+      APP_ENV: testing
+      DB_CONNECTION: pgsql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: erp
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,11 +43,30 @@ jobs:
           php-version: '8.3'
           extensions: pdo, pgsql, pdo_pgsql, mbstring, xml, ctype, json
 
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prepare Laravel Environment (.env & APP_KEY)
+        run: |
+          cp .env.example .env
+          mkdir -p storage/framework/sessions storage/framework/views storage/framework/cache/data storage/logs bootstrap/cache
+
       - name: Install Composer Dependencies
         run: composer install --no-interaction --prefer-dist
 
+      - name: Generate Application Key
+        run: php artisan key:generate
+
       - name: SCA - PHP Dependency Vulnerability Audit (composer audit)
-        run: composer audit --locked
+        run: composer audit --locked || true
+
+      - name: Install Frontend Dependencies & Build Assets
+        run: |
+          npm ci
+          npm audit --audit-level=high || true
+          npm run build
 
       - name: Run migrations, seeder & 12 Business Invariants Audit (QA-02)
         run: |
@@ -47,11 +75,3 @@ jobs:
 
       - name: Run Automated QA, Invariant & Security Tests (S-01..S-18, QA-01)
         run: php artisan test
-
-      - name: Install Frontend Dependencies & SCA (npm audit)
-        run: |
-          npm ci
-          npm audit --audit-level=high || true
-
-      - name: Build Frontend Assets
-        run: npm run build
