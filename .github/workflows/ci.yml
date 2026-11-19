@@ -1,0 +1,52 @@
+name: ERP Quality Assurance & Invariants Gate
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  qa-gate:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: erp
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pgsql, pdo_pgsql, mbstring, xml, ctype, json
+
+      - name: Install Composer Dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run migrations, seeder & 12 Business Invariants Audit (QA-02)
+        run: |
+          php artisan migrate:fresh --seed
+          php artisan erp:audit-invariants
+
+      - name: Run Automated Feature & Invariant Tests (QA-01, QA-03)
+        run: php artisan test
+
+      - name: Build Frontend Assets
+        run: |
+          npm ci
+          npm run build
+
