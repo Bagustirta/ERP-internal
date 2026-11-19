@@ -26,6 +26,7 @@ use App\Models\Warehouse;
 use App\Services\AccountingService;
 use App\Services\ApprovalQueueService;
 use App\Services\AuditLogService;
+use App\Services\DashboardLayoutService;
 use App\Services\DocumentNumberService;
 use App\Services\PayrollService;
 use App\Services\StockService;
@@ -339,6 +340,10 @@ class DashboardController extends Controller
 
         // 11. Aktivitas Terbaru (DASH-05, ROLE-05, T-R10: Filter menurut peran, hapus SWITCH_ROLE/LOGIN & redaksi email/IP untuk non-admin)
         $payload['recentActivities'] = $this->getFilteredActivities($user, $roleSlug);
+
+        // 12. Susun katalog widget terurut, KPI adaptif, deduplikasi, dan data spesifik peran (PRD Tata Letak Adaptif v0.1)
+        $layoutPayload = DashboardLayoutService::buildLayoutPayload($user, $roleSlug, $payload);
+        $payload = array_merge($payload, $layoutPayload);
 
         return Inertia::render('Dashboard/Index', $payload);
     }

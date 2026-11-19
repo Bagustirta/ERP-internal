@@ -6,7 +6,7 @@ use App\Models\AuditLog;
 use App\Models\Leave;
 use App\Models\SalesOrder;
 use App\Models\User;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Artisan;
 use Tests\TestCase;
 
 /**
@@ -15,12 +15,16 @@ use Tests\TestCase;
  */
 class RoleDashboardAndApprovalMatrixTest extends TestCase
 {
-    use RefreshDatabase;
+    protected static bool $seeded = false;
 
     protected function setUp(): void
     {
         parent::setUp();
-        $this->seed();
+
+        if (! self::$seeded) {
+            Artisan::call('migrate:fresh', ['--seed' => true]);
+            self::$seeded = true;
+        }
     }
 
     public function test_tr01_tr02_employee_dashboard_omits_all_financial_and_company_data(): void

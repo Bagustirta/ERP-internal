@@ -115,12 +115,33 @@ const navGroups = computed(() => {
         },
     ];
 
-    return groups
+    const nonEmpty = groups
         .map((g) => ({
             ...g,
             items: g.items.filter((i) => hasPerm(i.perm)),
         }))
         .filter((g) => g.items.length > 0);
+
+    // PRD Tata Letak Adaptif Bagian 7.3 (LAY-11, T-L13):
+    // Grup non-Utama dengan hanya 1 item digabung ke grup "Lainnya" (atau tanpa judul bila total item "Lainnya" hanya 1).
+    const finalGroups = [];
+    const singletonItems = [];
+
+    for (const g of nonEmpty) {
+        if (g.label !== 'Utama' && g.items.length === 1) {
+            singletonItems.push(g.items[0]);
+        } else {
+            finalGroups.push(g);
+        }
+    }
+
+    if (singletonItems.length === 1) {
+        finalGroups.push({ label: null, items: singletonItems });
+    } else if (singletonItems.length > 1) {
+        finalGroups.push({ label: 'Lainnya', items: singletonItems });
+    }
+
+    return finalGroups;
 });
 
 const currentModuleBarColor = computed(() => {
@@ -245,9 +266,20 @@ const userInitials = computed(() => {
         .toUpperCase();
 });
 
+const toggleSidebar = () => {
+    sidebarCollapsed.value = !sidebarCollapsed.value;
+    const key = `erp_sidebar_collapsed_${user.value?.id || 'guest'}`;
+    localStorage.setItem(key, sidebarCollapsed.value ? '1' : '0');
+};
+
 onMounted(() => {
     darkMode.value = localStorage.getItem('erp_dark_mode') === '1';
     document.documentElement.classList.toggle('dark', darkMode.value);
+
+    const savedSidebar = localStorage.getItem(`erp_sidebar_collapsed_${user.value?.id || 'guest'}`);
+    if (savedSidebar === '1') {
+        sidebarCollapsed.value = true;
+    }
 
     const savedDensity = localStorage.getItem('erp_table_density');
     if (savedDensity === 'padat' || savedDensity === 'nyaman') {
@@ -295,7 +327,7 @@ onUnmounted(() => {
                 </Link>
                 <button
                     type="button"
-                    @click="sidebarCollapsed = !sidebarCollapsed"
+                    @click="toggleSidebar"
                     class="p-1 rounded-[6px] text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 dark:hover:text-slate-200 transition mx-auto md:mx-0"
                     :title="sidebarCollapsed ? 'Perluas navigasi' : 'Ciutkan navigasi'"
                 >
@@ -323,9 +355,9 @@ onUnmounted(() => {
 
             <!-- Grouped Navigation (UI-09: Hapus titik warna di samping menu; gunakan badge angka yang bermakna) -->
             <nav class="flex-1 px-2 py-2 space-y-4 overflow-y-auto">
-                <div v-for="group in navGroups" :key="group.label" class="space-y-0.5">
+                <div v-for="(group, gIdx) in navGroups" :key="group.label || `ungrouped_${gIdx}`" class="space-y-0.5">
                     <div
-                        v-if="!sidebarCollapsed"
+                        v-if="!sidebarCollapsed && group.label"
                         class="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400"
                     >
                         {{ group.label }}
