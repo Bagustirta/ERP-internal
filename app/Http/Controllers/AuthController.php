@@ -95,7 +95,13 @@ class AuthController extends Controller
 
     public function quickSwitchUser(Request $request)
     {
+        // ROLE-01 & T-R13: Fitur beralih peran hanya aktif di lokal/staging, dimatikan di produksi
+        if (app()->isProduction()) {
+            abort(403, 'Fitur beralih peran tidak tersedia di lingkungan produksi.');
+        }
+
         $request->validate(['user_id' => 'required|exists:users,id']);
+        $previousUser = Auth::user();
         $user = User::with('role')->findOrFail($request->user_id);
 
         if (! $user->is_active) {
@@ -104,10 +110,17 @@ class AuthController extends Controller
 
         Auth::login($user);
         $request->session()->regenerate();
-        AuditLogService::log('Autentikasi', 'SWITCH_ROLE', null, "Beralih peran aktif ke {$user->name} ({$user->role?->name})");
+
+        // ROLE-03 & T-R14: Setiap peralihan tercatat di audit dengan pelaku, peran asal, peran tujuan, waktu
+        AuditLogService::log(
+            'Autentikasi',
+            'SWITCH_ROLE',
+            $user->role?->slug,
+            "Peralihan peran dari " . ($previousUser ? "{$previousUser->name} ({$previousUser->role?->name})" : 'Tamu') . " ke {$user->name} ({$user->role?->name})"
+        );
 
         if ($user->role?->slug === 'employee') {
-            return redirect('/hrm/portal')->with('success', "Beralih ke akun {$user->name} ({$user->role?->name})");
+            return redirect('/dashboard')->with('success', "Beralih ke akun {$user->name} ({$user->role?->name})");
         }
 
         return redirect('/dashboard')->with('success', "Beralih ke akun {$user->name} ({$user->role?->name})");

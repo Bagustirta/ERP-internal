@@ -6,14 +6,10 @@ use App\Models\CompanySetting;
 use App\Models\Customer;
 use App\Models\ErpNotification;
 use App\Models\Journal;
-use App\Models\Leave;
-use App\Models\PayrollRun;
 use App\Models\Product;
-use App\Models\PurchaseOrder;
-use App\Models\SalesOrder;
 use App\Models\StockBalance;
-use App\Models\StockOpname;
 use App\Models\User;
+use App\Services\ApprovalQueueService;
 use Illuminate\Http\Request;
 use Inertia\Middleware;
 
@@ -33,64 +29,16 @@ class HandleInertiaRequests extends Middleware
             $user->load(['role.permissions', 'employee']);
         }
 
-        $pendingInlineApprovals = fn () => $user ? collect()
-            ->concat(SalesOrder::with('customer')->where('status', 'Diajukan')->get()->map(fn ($so) => [
-                'category' => 'SO',
-                'doc_id' => $so->id,
-                'doc_number' => $so->so_number,
-                'module' => 'Penjualan',
-                'partner' => $so->customer?->name ?? '-',
-                'amount' => $so->grand_total,
-                'summary' => 'Melebihi batas kredit pelanggan',
-                'url' => '/sales',
-                'can_approve' => $user->hasPermission('sales.approve'),
-            ]))
-            ->concat(PurchaseOrder::with('supplier')->where('status', 'Diajukan')->get()->map(fn ($po) => [
-                'category' => 'PO',
-                'doc_id' => $po->id,
-                'doc_number' => $po->po_number,
-                'module' => 'Pembelian',
-                'partner' => $po->supplier?->name ?? '-',
-                'amount' => $po->grand_total,
-                'summary' => 'Nilai PO di atas ambang Rp 25 Juta',
-                'url' => '/purchasing',
-                'can_approve' => $user->hasPermission('purchasing.approve'),
-            ]))
-            ->concat(StockOpname::with('warehouse')->where('status', 'Diajukan')->get()->map(fn ($opn) => [
-                'category' => 'OPNAME',
-                'doc_id' => $opn->id,
-                'doc_number' => $opn->opname_number,
-                'module' => 'Inventori',
-                'partner' => $opn->warehouse?->name ?? '-',
-                'amount' => 1150000,
-                'summary' => 'Selisih hitung fisik stok opname',
-                'url' => '/inventory',
-                'can_approve' => $user->hasPermission('inventory.approve'),
-            ]))
-            ->concat(Leave::with('employee')->where('status', 'Diajukan')->get()->map(fn ($lv) => [
-                'category' => 'LEAVE',
-                'doc_id' => $lv->id,
-                'doc_number' => $lv->leave_number,
-                'module' => 'SDM',
-                'partner' => $lv->employee?->name ?? '-',
-                'amount' => 0,
-                'summary' => "{$lv->leave_type} ({$lv->days_count} hari)",
-                'url' => '/hrm',
-                'can_approve' => $user->hasPermission('hrm.approve'),
-            ]))
-            ->concat(PayrollRun::where('status', 'Diajukan')->get()->map(fn ($prl) => [
-                'category' => 'PAYROLL',
-                'doc_id' => $prl->id,
-                'doc_number' => $prl->payroll_number,
-                'module' => 'Payroll',
-                'partner' => "Periode {$prl->period_name}",
-                'amount' => $prl->total_net_pay,
-                'summary' => "{$prl->employee_count} karyawan menunggu otorisasi",
-                'url' => '/hrm?tab=payroll',
-                'can_approve' => $user->hasPermission('hrm.approve'),
-            ]))
-            ->values()
-            ->all() : [];
+        // APPR-08, T-A10, T-R11: Satu sumber perhitungan yang sama untuk badge sidebar, badge lonceng, tab dashboard, dan daftar persetujuan
+        $queueCache = null;
+        $getUserQueue = function () use (&$queueCache, $user) {
+            if ($queueCache === null) {
+                $queueCache = $user ? ApprovalQueueService::getPendingQueueForUser($user) : [];
+            }
+            return $queueCache;
+        };
+
+        $allowRoleSwitch = ! app()->isProduction(); // ROLE-01 & T-R13: Fitur beralih peran dimatikan di produksi
 
         return [
             ...parent::share($request),
@@ -107,8 +55,10 @@ class HandleInertiaRequests extends Middleware
                     ] : null,
                     'permissions' => $user->role ? $user->role->permissions->pluck('slug')->values()->all() : [],
                     'employee_id' => $user->employee?->id,
+                    'has_approval_authority' => ApprovalQueueService::hasAnyApprovalAuthority($user),
                 ] : null,
-                'demo_users' => fn () => $user ? User::with('role')->where('is_active', true)->orderBy('id')->get()->map(fn ($u) => [
+                'can_switch_role' => $allowRoleSwitch,
+                'demo_users' => fn () => ($user && $allowRoleSwitch) ? User::with('role')->where('is_active', true)->orderBy('id')->get()->map(fn ($u) => [
                     'id' => $u->id,
                     'name' => $u->name,
                     'role_name' => $u->role?->name ?? '-',
@@ -119,21 +69,40 @@ class HandleInertiaRequests extends Middleware
             'notifications' => fn () => $user ? [
                 'unread_count' => ErpNotification::where('is_read', false)
                     ->where(function ($q) use ($user) {
-                        $q->whereNull('user_id')->orWhere('user_id', $user->id);
+                        $q->where('user_id', $user->id)
+                            ->orWhere(function ($q2) use ($user) {
+                                $q2->whereNull('user_id')
+                                    ->where(function ($q3) use ($user) {
+                                        $q3->where('role_slug', $user->role?->slug);
+                                        if ($user->hasRole(['admin', 'manager'])) {
+                                            $q3->orWhereNull('role_slug');
+                                        }
+                                    });
+                            });
                     })->count(),
                 'items' => ErpNotification::where(function ($q) use ($user) {
-                    $q->whereNull('user_id')->orWhere('user_id', $user->id);
+                    $q->where('user_id', $user->id)
+                        ->orWhere(function ($q2) use ($user) {
+                            $q2->whereNull('user_id')
+                                ->where(function ($q3) use ($user) {
+                                    $q3->where('role_slug', $user->role?->slug);
+                                    if ($user->hasRole(['admin', 'manager'])) {
+                                        $q3->orWhereNull('role_slug');
+                                    }
+                                });
+                        });
                 })->latest()->limit(8)->get(),
-                'inline_approvals' => $pendingInlineApprovals(),
+                'inline_approvals' => $getUserQueue(),
             ] : ['unread_count' => 0, 'items' => [], 'inline_approvals' => []],
-            'data_health' => fn () => $user ? [
+            // Hanya kirim data_health ke peran yang berhak melihatnya (DASH-02)
+            'data_health' => fn () => ($user && ! $user->hasRole(['employee', 'sales'])) ? [
                 'products_without_price' => Product::where('selling_price', '<=', 0)->orWhere('purchase_price', '<=', 0)->count(),
                 'customers_without_npwp' => Customer::whereNull('npwp')->orWhere('npwp', '')->count(),
                 'unbalanced_journals' => Journal::whereColumn('total_debit', '!=', 'total_credit')->count(),
                 'negative_stocks' => StockBalance::where('qty_on_hand', '<', 0)->count(),
                 'low_stocks' => StockBalance::with('product')->get()->filter(fn ($b) => $b->product && $b->qty_on_hand <= $b->product->min_stock)->count(),
             ] : null,
-            'pending_approvals_count' => fn () => $user ? count($pendingInlineApprovals()) : 0,
+            'pending_approvals_count' => fn () => $user ? count($getUserQueue()) : 0,
             'flash' => [
                 'success' => fn () => $request->session()->get('success'),
                 'error' => fn () => $request->session()->get('error'),

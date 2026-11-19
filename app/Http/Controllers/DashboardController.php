@@ -7,9 +7,11 @@ use App\Models\AuditLog;
 use App\Models\BankAccount;
 use App\Models\CashTransaction;
 use App\Models\Customer;
+use App\Models\Employee;
 use App\Models\Leave;
 use App\Models\Payment;
 use App\Models\PayrollRun;
+use App\Models\Payslip;
 use App\Models\PurchaseInvoice;
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseOrderItem;
@@ -19,8 +21,10 @@ use App\Models\SalesOrder;
 use App\Models\StockBalance;
 use App\Models\StockOpname;
 use App\Models\Supplier;
+use App\Models\User;
 use App\Models\Warehouse;
 use App\Services\AccountingService;
+use App\Services\ApprovalQueueService;
 use App\Services\AuditLogService;
 use App\Services\DocumentNumberService;
 use App\Services\PayrollService;
@@ -33,73 +37,124 @@ use Inertia\Inertia;
 
 class DashboardController extends Controller
 {
+    /**
+     * PRD Dashboard Berbasis Peran & Filter Data di Server (v0.2):
+     * - Controller menyusun payload per widget berdasarkan matriks izin & peran di server (DASH-01, DASH-02, DASH-03).
+     * - Widget tanpa izin TIDAK ADA di respons Inertia sama sekali (bukan disembunyikan di CSS/Vue).
+     * - Aktivitas Terbaru difilter menurut peran & menghapus email/IP/SWITCH_ROLE untuk non-admin (DASH-05, ROLE-05, T-R10).
+     */
     public function index(Request $request)
     {
+        $user = $request->user();
+        $roleSlug = $user->role?->slug ?? 'employee';
+
+        // Tentukan kapabilitas widget sesuai Matriks Bagian 4 (DASH-01..DASH-09)
+        $isExecutiveOrFinance = in_array($roleSlug, ['manager', 'finance'], true);
+        $isSales = $roleSlug === 'sales';
+        $isPurchasing = $roleSlug === 'purchasing';
+        $isWarehouse = $roleSlug === 'warehouse';
+        $isHr = $roleSlug === 'hr';
+        $isAdmin = $roleSlug === 'admin';
+        $isEmployee = $roleSlug === 'employee';
+
+        $canSeeFinanceKpis = $isExecutiveOrFinance;
+        $canSeeSales = $isExecutiveOrFinance || $isSales;
+        $canSeePurchasing = $isExecutiveOrFinance || $isPurchasing;
+        $canSeeStock = in_array($roleSlug, ['manager', 'sales', 'purchasing', 'warehouse'], true);
+        $canSeeTaxAndBpjs = $isExecutiveOrFinance || $isHr;
+        $canSeeTrend = $isExecutiveOrFinance || $isSales || $isPurchasing;
+        $canSeeTopCustomers = $isExecutiveOrFinance || $isSales;
+        $canSeeCashflow = $isExecutiveOrFinance;
+        $canSeeDataHealth = ! $isEmployee && ! $isSales;
+        $canSeeSystemHealth = $isAdmin;
+
         $startOfMonth = now()->startOfMonth()->toDateString();
         $endOfMonth = now()->endOfMonth()->toDateString();
 
-        $salesThisMonth = (float) SalesInvoice::whereBetween('invoice_date', [$startOfMonth, $endOfMonth])
-            ->where('status', '!=', 'Batal')
-            ->sum('grand_total');
+        // Daftar tindakan persetujuan memakai satu sumber kebenaran yang sama dengan menu Persetujuan & Lonceng (APPR-08)
+        $pendingTasks = ApprovalQueueService::getPendingQueueForUser($user);
+        $mySubmissions = ApprovalQueueService::getMySubmissionsForUser($user);
 
-        $purchasesThisMonth = (float) PurchaseInvoice::whereBetween('invoice_date', [$startOfMonth, $endOfMonth])
-            ->where('status', '!=', 'Batal')
-            ->sum('grand_total');
+        // Payload Inertia disusun secara selektif (DASH-02: widget tanpa izin tidak dikirim sama sekali)
+        $payload = [
+            'roleScope' => $roleSlug,
+            'visibleWidgets' => [
+                'kpi_strip' => $canSeeFinanceKpis || $canSeeSales || $canSeePurchasing || $canSeeStock || $isHr,
+                'priority_actions' => ! $isAdmin && ! $isEmployee,
+                'my_summary' => $isEmployee || (bool) $user->employee,
+                'tax_bpjs' => $canSeeTaxAndBpjs,
+                'trend' => $canSeeTrend,
+                'data_health' => $canSeeDataHealth,
+                'ar_ap' => $canSeeSales || $canSeePurchasing,
+                'low_stock' => $canSeeStock,
+                'top_customers' => $canSeeTopCustomers,
+                'calendar' => true,
+                'recent_activities' => true,
+                'cashflow' => $canSeeCashflow,
+                'system_health' => $canSeeSystemHealth,
+            ],
+            'pendingTasks' => $pendingTasks,
+            'mySubmissions' => $mySubmissions,
+        ];
 
-        $receivablesDue = (float) SalesInvoice::where('balance_due', '>', 0)
-            ->where('status', '!=', 'Batal')
-            ->sum('balance_due');
+        // 1. KPI Strip — hanya field yang berhak dilihat peran ini (T-R02, T-R09)
+        $kpis = ['pending_approval_count' => count($pendingTasks)];
 
-        $payablesDue = (float) PurchaseInvoice::where('balance_due', '>', 0)
-            ->where('status', '!=', 'Batal')
-            ->sum('balance_due');
+        if ($canSeeFinanceKpis) {
+            $kpis['cash_balance'] = (float) BankAccount::where('is_active', true)->sum('current_balance');
+            $ppnKeluaran = (float) (Account::where('code', '2106')->value('current_balance') ?? 0);
+            $ppnMasukan = (float) (Account::where('code', '1106')->value('current_balance') ?? 0);
+            $pph21Payable = (float) (Account::where('code', '2105')->value('current_balance') ?? 0);
+            $bpjsPayable = (float) (Account::where('code', '2104')->value('current_balance') ?? 0);
 
-        $cashAndBankBalance = (float) BankAccount::where('is_active', true)->sum('current_balance');
+            $currentPayroll = PayrollRun::where('period_month', now()->format('Y-m'))->first() ?: PayrollRun::latest('id')->first();
+            $pph21Estimated = (float) ($currentPayroll?->total_pph21 ?? 0);
+            $bpjsEstimated = (float) (($currentPayroll?->total_bpjs_company ?? 0) + ($currentPayroll?->total_bpjs_employee ?? 0));
+            $payrollStatusLabel = $currentPayroll && ! in_array($currentPayroll->status, ['Disetujui', 'Dibayar', 'Selesai'])
+                ? 'Menunggu payroll ' . ($currentPayroll->period_name ?: 'November')
+                : null;
 
-        $ppnKeluaran = (float) (Account::where('code', '2106')->value('current_balance') ?? 0);
-        $ppnMasukan = (float) (Account::where('code', '1106')->value('current_balance') ?? 0);
-        $pph21Payable = (float) (Account::where('code', '2105')->value('current_balance') ?? 0);
-        $bpjsPayable = (float) (Account::where('code', '2104')->value('current_balance') ?? 0);
+            $kpis['tax_total'] = $ppnKeluaran + ($pph21Payable > 0 ? $pph21Payable : $pph21Estimated);
+            $kpis['ppn_keluaran'] = $ppnKeluaran;
+            $kpis['ppn_masukan'] = $ppnMasukan;
+            $kpis['pph21_payable'] = $pph21Payable;
+            $kpis['pph21_estimated'] = $pph21Estimated;
+            $kpis['bpjs_payable'] = $bpjsPayable;
+            $kpis['bpjs_estimated'] = $bpjsEstimated;
+            $kpis['payroll_status_label'] = $payrollStatusLabel;
+        } elseif ($isHr) {
+            $pph21Payable = (float) (Account::where('code', '2105')->value('current_balance') ?? 0);
+            $bpjsPayable = (float) (Account::where('code', '2104')->value('current_balance') ?? 0);
+            $currentPayroll = PayrollRun::where('period_month', now()->format('Y-m'))->first() ?: PayrollRun::latest('id')->first();
+            $kpis['employee_count'] = Employee::where('is_active', true)->count();
+            $kpis['pending_leaves_count'] = Leave::where('status', 'Diajukan')->count();
+            $kpis['pph21_payable'] = $pph21Payable;
+            $kpis['pph21_estimated'] = (float) ($currentPayroll?->total_pph21 ?? 0);
+            $kpis['bpjs_payable'] = $bpjsPayable;
+            $kpis['bpjs_estimated'] = (float) (($currentPayroll?->total_bpjs_company ?? 0) + ($currentPayroll?->total_bpjs_employee ?? 0));
+            $kpis['payroll_status_label'] = $currentPayroll && ! in_array($currentPayroll->status, ['Disetujui', 'Dibayar', 'Selesai'])
+                ? 'Menunggu payroll ' . ($currentPayroll->period_name ?: 'November')
+                : null;
+        }
 
-        // UI-06 & T-D07: Bila payroll belum disetujui (saldo PPh 21 & BPJS di buku besar masih 0), tampilkan status "Menunggu payroll" & estimasi dari run
-        $currentPayroll = PayrollRun::where('period_month', now()->format('Y-m'))->first()
-            ?: PayrollRun::latest('id')->first();
-        $pph21Estimated = (float) ($currentPayroll?->total_pph21 ?? 0);
-        $bpjsEstimated = (float) (($currentPayroll?->total_bpjs_company ?? 0) + ($currentPayroll?->total_bpjs_employee ?? 0));
-        $payrollStatusLabel = $currentPayroll && ! in_array($currentPayroll->status, ['Disetujui', 'Dibayar', 'Selesai'])
-            ? 'Menunggu payroll ' . ($currentPayroll->period_name ?: 'November')
-            : null;
+        // 2. Penjualan & Piutang (Manager, Finance, Sales)
+        $overdueReceivables = collect();
+        if ($canSeeSales) {
+            $salesQuery = SalesInvoice::whereBetween('invoice_date', [$startOfMonth, $endOfMonth])->where('status', '!=', 'Batal');
+            if ($isSales) {
+                $salesQuery->where('created_by', $user->id);
+            }
+            $kpis['sales_this_month'] = (float) $salesQuery->sum('grand_total');
 
-        // UI-07: Stok Kritis dengan nama produk, SKU, gudang, warehouse_id, stok/minimum, kekurangan, tanpa duplikat pada gudang yang sama
-        $lowStockItems = StockBalance::with(['product.unit', 'warehouse'])
-            ->get()
-            ->filter(fn ($b) => $b->product && $b->qty_on_hand <= $b->product->min_stock)
-            ->unique(fn ($b) => $b->product_id . '-' . $b->warehouse_id)
-            ->values()
-            ->map(fn ($b) => [
-                'id' => $b->id,
-                'product_id' => $b->product_id,
-                'warehouse_id' => $b->warehouse_id,
-                'sku' => $b->product->sku,
-                'product_name' => $b->product->name,
-                'warehouse_name' => $b->warehouse?->name ?? '-',
-                'qty_on_hand' => (float) $b->qty_on_hand,
-                'min_stock' => (float) $b->product->min_stock,
-                'shortage_qty' => max(1, (float) $b->product->min_stock - (float) $b->qty_on_hand),
-                'reorder_qty' => max(5, ((float) $b->product->min_stock * 2) - (float) $b->qty_on_hand),
-                'purchase_price' => (float) $b->product->purchase_price,
-                'unit' => $b->product->unit?->code ?? 'UNIT',
-            ]);
+            $arQuery = SalesInvoice::with(['customer', 'salesOrder.deliveries', 'receipts'])
+                ->where('balance_due', '>', 0)
+                ->where('status', '!=', 'Batal')
+                ->orderBy('due_date');
+            if ($isSales) {
+                $arQuery->where('created_by', $user->id);
+            }
 
-        $pendingTasks = $this->collectPendingApprovals();
-
-        // UI-04, UI-10, UI-17: Piutang jatuh tempo dengan perhitungan umur, keterlambatan, dan jejak dokumen mini
-        $overdueReceivables = SalesInvoice::with(['customer', 'salesOrder.deliveries', 'receipts'])
-            ->where('balance_due', '>', 0)
-            ->where('status', '!=', 'Batal')
-            ->orderBy('due_date')
-            ->get()
-            ->map(function ($inv) {
+            $overdueReceivables = $arQuery->get()->map(function ($inv) {
                 $due = Carbon::parse($inv->due_date);
                 $daysDiff = (int) now()->startOfDay()->diffInDays($due->startOfDay(), false);
                 $urgency = $daysDiff < 0 ? 'Lewat Jatuh Tempo' : ($daysDiff <= 7 ? 'Segera Jatuh Tempo' : 'Belum Jatuh Tempo');
@@ -128,138 +183,178 @@ class DashboardController extends Controller
                     ],
                 ];
             });
+            $kpis['receivables_due'] = (float) $overdueReceivables->sum('balance_due');
+            $payload['overdueReceivables'] = $overdueReceivables;
+        }
 
-        $openPayables = PurchaseInvoice::with(['supplier', 'purchaseOrder.goodsReceipts', 'payments'])
-            ->where('balance_due', '>', 0)
-            ->where('status', '!=', 'Batal')
-            ->orderBy('due_date')
-            ->get()
-            ->map(function ($inv) {
-                $due = Carbon::parse($inv->due_date);
-                $daysDiff = (int) now()->startOfDay()->diffInDays($due->startOfDay(), false);
-                $ageText = $daysDiff < 0
-                    ? 'Terlambat ' . abs($daysDiff) . ' hari'
-                    : ($daysDiff === 0 ? 'Jatuh tempo hari ini' : 'JT ' . $daysDiff . ' hari lagi');
+        // 3. Pembelian & Hutang (Manager, Finance, Purchasing)
+        $openPayables = collect();
+        if ($canSeePurchasing) {
+            $kpis['purchases_this_month'] = (float) PurchaseInvoice::whereBetween('invoice_date', [$startOfMonth, $endOfMonth])
+                ->where('status', '!=', 'Batal')
+                ->sum('grand_total');
 
-                return [
-                    'id' => $inv->id,
-                    'invoice_number' => $inv->invoice_number,
-                    'supplier_invoice' => $inv->supplier_invoice_number,
-                    'supplier_name' => $inv->supplier?->name ?? '-',
-                    'due_date' => $inv->due_date?->format('Y-m-d'),
-                    'balance_due' => (float) $inv->balance_due,
-                    'days_diff' => $daysDiff,
-                    'age_label' => $ageText,
-                    'urgency' => $daysDiff < 0 ? 'Lewat Jatuh Tempo' : 'Segera Jatuh Tempo',
-                ];
-            });
+            $openPayables = PurchaseInvoice::with(['supplier'])
+                ->where('balance_due', '>', 0)
+                ->where('status', '!=', 'Batal')
+                ->orderBy('due_date')
+                ->get()
+                ->map(function ($inv) {
+                    $due = Carbon::parse($inv->due_date);
+                    $daysDiff = (int) now()->startOfDay()->diffInDays($due->startOfDay(), false);
+                    $ageText = $daysDiff < 0
+                        ? 'Terlambat ' . abs($daysDiff) . ' hari'
+                        : ($daysDiff === 0 ? 'Jatuh tempo hari ini' : 'JT ' . $daysDiff . ' hari lagi');
 
-        $chartTrend = [
-            ['label' => 'Jun', 'month' => '2026-06', 'sales' => 142000000, 'purchases' => 98000000],
-            ['label' => 'Jul', 'month' => '2026-07', 'sales' => 164500000, 'purchases' => 112000000],
-            ['label' => 'Agu', 'month' => '2026-08', 'sales' => 158000000, 'purchases' => 104500000],
-            ['label' => 'Sep', 'month' => '2026-09', 'sales' => 189000000, 'purchases' => 125000000],
-            ['label' => 'Okt', 'month' => '2026-10', 'sales' => 212000000, 'purchases' => 141000000],
-            ['label' => 'Nov', 'month' => '2026-11', 'sales' => $salesThisMonth ?: 245000000, 'purchases' => $purchasesThisMonth ?: 185000000],
-        ];
+                    return [
+                        'id' => $inv->id,
+                        'invoice_number' => $inv->invoice_number,
+                        'supplier_invoice' => $inv->supplier_invoice_number,
+                        'supplier_name' => $inv->supplier?->name ?? '-',
+                        'due_date' => $inv->due_date?->format('Y-m-d'),
+                        'balance_due' => (float) $inv->balance_due,
+                        'days_diff' => $daysDiff,
+                        'age_label' => $ageText,
+                        'urgency' => $daysDiff < 0 ? 'Lewat Jatuh Tempo' : 'Segera Jatuh Tempo',
+                    ];
+                });
+            $kpis['payables_due'] = (float) $openPayables->sum('balance_due');
+            $payload['openPayables'] = $openPayables;
+        }
 
-        // Cashflow 30 Days Widget (UI-14)
-        $cashIn30d = (float) Receipt::where('receipt_date', '>=', now()->subDays(30)->toDateString())->sum('amount')
-            + (float) CashTransaction::where('type', 'IN')->where('transaction_date', '>=', now()->subDays(30)->toDateString())->sum('amount');
-        $cashOut30d = (float) Payment::where('payment_date', '>=', now()->subDays(30)->toDateString())->sum('amount')
-            + (float) CashTransaction::where('type', 'OUT')->where('transaction_date', '>=', now()->subDays(30)->toDateString())->sum('amount');
+        // 4. Stok Kritis (Manager, Sales lihat saja, Purchasing, Warehouse)
+        if ($canSeeStock) {
+            $lowStockItems = StockBalance::with(['product.unit', 'warehouse'])
+                ->get()
+                ->filter(fn ($b) => $b->product && $b->qty_on_hand <= $b->product->min_stock)
+                ->unique(fn ($b) => $b->product_id . '-' . $b->warehouse_id)
+                ->values()
+                ->map(fn ($b) => [
+                    'id' => $b->id,
+                    'product_id' => $b->product_id,
+                    'warehouse_id' => $b->warehouse_id,
+                    'sku' => $b->product->sku,
+                    'product_name' => $b->product->name,
+                    'warehouse_name' => $b->warehouse?->name ?? '-',
+                    'qty_on_hand' => (float) $b->qty_on_hand,
+                    'min_stock' => (float) $b->product->min_stock,
+                    'shortage_qty' => max(1, (float) $b->product->min_stock - (float) $b->qty_on_hand),
+                    'reorder_qty' => max(5, ((float) $b->product->min_stock * 2) - (float) $b->qty_on_hand),
+                    'purchase_price' => $isSales ? 0 : (float) $b->product->purchase_price,
+                    'unit' => $b->product->unit?->code ?? 'UNIT',
+                ]);
+            $kpis['low_stock_count'] = $lowStockItems->count();
+            $payload['lowStockItems'] = $lowStockItems;
+        }
 
-        // UI-08: Aktivitas Terbaru HANYA peristiwa bisnis (dibuat, disetujui, dibayar, dibatalkan) dengan waktu relatif & tautan dokumen
-        $recentActivities = AuditLog::whereNotIn('action', ['LOGIN', 'LOGOUT', 'SEED', 'QUICK_SWITCH'])
-            ->where('module', '!=', 'Sistem')
-            ->latest('created_at')
-            ->limit(8)
-            ->get()
-            ->map(function ($log) {
-                $docUrl = match ($log->module) {
-                    'Penjualan' => '/sales',
-                    'Pembelian' => '/purchasing',
-                    'Inventori', 'Inventori & Gudang' => '/inventory',
-                    'Keuangan' => '/finance',
-                    'SDM & Payroll', 'SDM & Cuti' => '/hrm',
-                    default => '/settings',
-                };
-                return [
-                    'id' => $log->id,
-                    'user_name' => $log->user_name,
-                    'module' => $log->module,
-                    'action' => $log->action,
-                    'document_number' => $log->document_number,
-                    'description' => $log->description,
-                    'relative_time' => $log->created_at ? Carbon::parse($log->created_at)->locale('id')->diffForHumans() : 'Baru saja',
-                    'url' => $docUrl,
-                ];
-            });
+        $payload['kpis'] = $kpis;
 
-        // UI-01 & 15.6: Widget Top 5 Pelanggan di bawah Kolom 1 agar ketiga kolom berakhir sejajar
-        $allInvoicesMonth = SalesInvoice::with('customer')
-            ->where('status', '!=', 'Batal')
-            ->get();
-        $totalAllSales = max(1, (float) $allInvoicesMonth->sum('grand_total'));
+        // 5. Tren Penjualan & Pembelian (Manager, Finance, Sales, Purchasing)
+        if ($canSeeTrend) {
+            $payload['chartTrend'] = [
+                ['label' => 'Jun', 'month' => '2026-06', 'sales' => $isPurchasing ? 0 : 142000000, 'purchases' => $isSales ? 0 : 98000000],
+                ['label' => 'Jul', 'month' => '2026-07', 'sales' => $isPurchasing ? 0 : 164500000, 'purchases' => $isSales ? 0 : 112000000],
+                ['label' => 'Agu', 'month' => '2026-08', 'sales' => $isPurchasing ? 0 : 158000000, 'purchases' => $isSales ? 0 : 104500000],
+                ['label' => 'Sep', 'month' => '2026-09', 'sales' => $isPurchasing ? 0 : 189000000, 'purchases' => $isSales ? 0 : 125000000],
+                ['label' => 'Okt', 'month' => '2026-10', 'sales' => $isPurchasing ? 0 : 212000000, 'purchases' => $isSales ? 0 : 141000000],
+                ['label' => 'Nov', 'month' => '2026-11', 'sales' => $isPurchasing ? 0 : ($kpis['sales_this_month'] ?? 245000000), 'purchases' => $isSales ? 0 : ($kpis['purchases_this_month'] ?? 185000000)],
+            ];
+        }
 
-        $topCustomers = Customer::with('salesInvoices')
-            ->where('is_active', true)
-            ->get()
-            ->map(function ($c) use ($totalAllSales) {
-                $val = (float) $c->salesInvoices->where('status', '!=', 'Batal')->sum('grand_total');
-                return [
-                    'id' => $c->id,
-                    'code' => $c->code,
-                    'name' => $c->name,
-                    'total_sales' => $val,
-                    'percentage' => round(($val / $totalAllSales) * 100, 1),
-                ];
-            })
-            ->sortByDesc('total_sales')
-            ->take(5)
-            ->values();
+        // 6. Arus Kas 30 Hari (Hanya Direksi & Keuangan)
+        if ($canSeeCashflow) {
+            $cashIn30d = (float) Receipt::where('receipt_date', '>=', now()->subDays(30)->toDateString())->sum('amount')
+                + (float) CashTransaction::where('type', 'IN')->where('transaction_date', '>=', now()->subDays(30)->toDateString())->sum('amount');
+            $cashOut30d = (float) Payment::where('payment_date', '>=', now()->subDays(30)->toDateString())->sum('amount')
+                + (float) CashTransaction::where('type', 'OUT')->where('transaction_date', '>=', now()->subDays(30)->toDateString())->sum('amount');
 
-        // UI-11 & T-D06: Kalender dengan jatuh tempo nyata selain hari libur (gabungkan cuti bersama & aturan jatuh tempo mundur ke hari kerja berikutnya)
-        $calendarEvents = $this->buildCalendarEvents($overdueReceivables, $openPayables);
-
-        return Inertia::render('Dashboard/Index', [
-            'kpis' => [
-                'cash_balance' => $cashAndBankBalance,
-                'sales_this_month' => $salesThisMonth,
-                'purchases_this_month' => $purchasesThisMonth,
-                'receivables_due' => $receivablesDue,
-                'payables_due' => $payablesDue,
-                'low_stock_count' => $lowStockItems->count(),
-                'tax_total' => $ppnKeluaran + ($pph21Payable > 0 ? $pph21Payable : $pph21Estimated),
-                'ppn_keluaran' => $ppnKeluaran,
-                'ppn_masukan' => $ppnMasukan,
-                'pph21_payable' => $pph21Payable,
-                'pph21_estimated' => $pph21Estimated,
-                'bpjs_payable' => $bpjsPayable,
-                'bpjs_estimated' => $bpjsEstimated,
-                'payroll_status_label' => $payrollStatusLabel,
-                'pending_approval_count' => count($pendingTasks),
-            ],
-            'cashflow30d' => [
+            $payload['cashflow30d'] = [
                 'cash_in' => $cashIn30d,
                 'cash_out' => $cashOut30d,
                 'net' => $cashIn30d - $cashOut30d,
-            ],
-            'lowStockItems' => $lowStockItems,
-            'pendingTasks' => $pendingTasks,
-            'overdueReceivables' => $overdueReceivables,
-            'openPayables' => $openPayables,
-            'chartTrend' => $chartTrend,
-            'recentActivities' => $recentActivities,
-            'topCustomers' => $topCustomers,
-            'calendarEvents' => $calendarEvents,
-        ]);
+            ];
+        }
+
+        // 7. Top 5 Pelanggan (Hanya Direksi, Keuangan, Sales)
+        if ($canSeeTopCustomers) {
+            $allInvoicesMonth = SalesInvoice::where('status', '!=', 'Batal')
+                ->when($isSales, fn ($q) => $q->where('created_by', $user->id))
+                ->get();
+            $totalAllSales = max(1, (float) $allInvoicesMonth->sum('grand_total'));
+
+            $payload['topCustomers'] = Customer::with('salesInvoices')
+                ->where('is_active', true)
+                ->get()
+                ->map(function ($c) use ($totalAllSales, $isSales, $user) {
+                    $val = (float) $c->salesInvoices
+                        ->where('status', '!=', 'Batal')
+                        ->when($isSales, fn ($col) => $col->where('created_by', $user->id))
+                        ->sum('grand_total');
+                    return [
+                        'id' => $c->id,
+                        'code' => $c->code,
+                        'name' => $c->name,
+                        'total_sales' => $val,
+                        'percentage' => round(($val / $totalAllSales) * 100, 1),
+                    ];
+                })
+                ->sortByDesc('total_sales')
+                ->take(5)
+                ->values();
+        }
+
+        // 8. Ringkasan Pribadi Staf / Karyawan (Bagian 5.1 & DASH-04: sisa cuti, status pengajuan cuti miliknya, slip gaji terbaru milik sendiri)
+        if ($user->employee) {
+            $emp = $user->employee;
+            $latestSlip = Payslip::with('payrollRun')->where('employee_id', $emp->id)->latest('id')->first();
+            $payload['personalSummary'] = [
+                'emp_code' => $emp->emp_code,
+                'name' => $emp->name,
+                'department' => $emp->department,
+                'position' => $emp->position,
+                'annual_leave_quota' => (int) $emp->annual_leave_quota,
+                'pending_leave_count' => Leave::where('employee_id', $emp->id)->where('status', 'Diajukan')->count(),
+                'latest_payslip' => $latestSlip ? [
+                    'id' => $latestSlip->id,
+                    'payslip_number' => $latestSlip->payslip_number,
+                    'period_name' => $latestSlip->payrollRun?->period_name ?? 'Bulan Ini',
+                ] : null,
+            ];
+        }
+
+        // 9. Kesehatan Sistem untuk Admin Sistem (Bagian 5.7 & T-R09: Tanpa data keuangan/gaji)
+        if ($canSeeSystemHealth) {
+            $payload['systemHealth'] = [
+                'active_users' => User::where('is_active', true)->count(),
+                'inactive_users' => User::where('is_active', false)->count(),
+                'failed_logins_24h' => AuditLog::whereIn('action', ['LOGIN_FAILED', 'LOGIN_LOCKED'])->where('created_at', '>=', now()->subDay())->count(),
+                'security_alerts_7d' => AuditLog::whereIn('action', ['IDOR_BLOCKED', 'ANOMALY_SPLIT_PO', 'SENSITIVE_SUPPLIER_CHANGE'])->where('created_at', '>=', now()->subDays(7))->count(),
+                'total_audit_logs' => AuditLog::count(),
+                'app_env' => config('app.env'),
+            ];
+        }
+
+        // 10. Kalender (Disesuaikan lingkup peran: Staf/Gudang/HR/Admin hanya melihat hari libur; Sales melihat piutang; Pembelian melihat hutang)
+        $payload['calendarEvents'] = $this->buildCalendarEvents($overdueReceivables, $openPayables);
+
+        // 11. Aktivitas Terbaru (DASH-05, ROLE-05, T-R10: Filter menurut peran, hapus SWITCH_ROLE/LOGIN & redaksi email/IP untuk non-admin)
+        $payload['recentActivities'] = $this->getFilteredActivities($user, $roleSlug);
+
+        return Inertia::render('Dashboard/Index', $payload);
     }
 
-    public function approvals()
+    /**
+     * Halaman Pusat Persetujuan / Pengajuan Saya (14.4, APPR-06, APPR-07, T-A01, T-A03, T-A11)
+     */
+    public function approvals(Request $request)
     {
+        $user = $request->user();
+        $hasAuthority = ApprovalQueueService::hasAnyApprovalAuthority($user);
+
         return Inertia::render('Dashboard/Approvals', [
-            'pendingItems' => $this->collectPendingApprovals(),
+            'hasApprovalAuthority' => $hasAuthority,
+            'pendingItems' => ApprovalQueueService::getPendingQueueForUser($user),
+            'mySubmissions' => ApprovalQueueService::getMySubmissionsForUser($user),
         ]);
     }
 
@@ -272,7 +367,12 @@ class DashboardController extends Controller
             'notes' => 'nullable|string',
         ]);
 
-        // T-D04 & F12: Periksa hak akses persetujuan di server
+        // APPR-10 & T-A13: Penolakan wajib disertai catatan
+        if ($data['decision'] === 'reject' && trim((string) ($data['notes'] ?? '')) === '') {
+            return back()->withErrors(['notes' => 'Catatan alasan penolakan wajib diisi.']);
+        }
+
+        // APPR-04, T-A02, T-A04: Pemeriksaan wewenang diulang di server saat aksi dijalankan
         $this->authorizeApprovalCategory($request->user(), $data['doc_category']);
 
         return DB::transaction(function () use ($data) {
@@ -281,9 +381,6 @@ class DashboardController extends Controller
         });
     }
 
-    /**
-     * Persetujuan Massal (Bulk Approval) - T-D03 & T-D04
-     */
     public function processBulkApproval(Request $request)
     {
         $data = $request->validate([
@@ -314,11 +411,13 @@ class DashboardController extends Controller
         });
     }
 
-    /**
-     * Buat PO Otomatis untuk Semua SKU di Bawah Minimum ("Buat PO untuk semua") - UI-18
-     */
-    public function createBulkRestockPo()
+    public function createBulkRestockPo(Request $request)
     {
+        $user = $request->user();
+        if (! $user || ! $user->hasPermission('purchasing.create')) {
+            abort(403, 'Anda tidak memiliki hak akses untuk membuat PO restock.');
+        }
+
         return DB::transaction(function () {
             $lowBalances = StockBalance::with('product')
                 ->get()
@@ -389,22 +488,11 @@ class DashboardController extends Controller
         });
     }
 
-    private function authorizeApprovalCategory($user, string $category): void
+    private function authorizeApprovalCategory(?User $user, string $category): void
     {
-        if (! $user) {
-            abort(403, 'Tidak terautentikasi.');
-        }
-
-        $requiredPerm = match ($category) {
-            'SO' => 'sales.approve',
-            'PO', 'PR' => 'purchasing.approve',
-            'OPNAME' => 'inventory.approve',
-            'LEAVE', 'PAYROLL' => 'hrm.approve',
-            default => 'dashboard.view',
-        };
-
-        if (! $user->hasPermission($requiredPerm)) {
-            abort(403, "Anda tidak memiliki hak otorisasi [{$requiredPerm}] untuk menyetujui dokumen {$category}.");
+        if (! $user || ! ApprovalQueueService::canUserApproveCategory($user, $category)) {
+            AuditLogService::log('Keamanan', 'APPROVAL_DENIED', $category, "Penolakan otorisasi persetujuan {$category} untuk {$user?->email} ({$user?->role?->slug})");
+            abort(403, "Anda tidak memiliki wewenang persetujuan untuk kategori dokumen {$category}.");
         }
     }
 
@@ -538,11 +626,66 @@ class DashboardController extends Controller
         }
     }
 
+    private function getFilteredActivities(User $user, string $roleSlug): array
+    {
+        $query = AuditLog::whereNotIn('action', ['LOGIN', 'LOGOUT', 'SEED', 'QUICK_SWITCH', 'SWITCH_ROLE'])
+            ->where('module', '!=', 'Sistem');
+
+        if ($roleSlug === 'employee') {
+            $query->where('user_id', $user->id);
+        } elseif ($roleSlug === 'sales') {
+            $query->where('module', 'Penjualan');
+        } elseif ($roleSlug === 'purchasing') {
+            $query->where('module', 'Pembelian');
+        } elseif ($roleSlug === 'warehouse') {
+            $query->whereIn('module', ['Inventori', 'Inventori & Gudang']);
+        } elseif ($roleSlug === 'finance') {
+            $query->whereIn('module', ['Keuangan', 'Penjualan', 'Pembelian']);
+        } elseif ($roleSlug === 'hr') {
+            $query->whereIn('module', ['SDM & Payroll', 'SDM & Cuti']);
+        } elseif ($roleSlug === 'admin') {
+            $query = AuditLog::whereIn('module', ['Pengaturan', 'Autentikasi', 'Keamanan'])
+                ->where('action', '!=', 'SEED');
+        }
+
+        return $query->latest('created_at')->limit(6)->get()->map(function ($log) use ($roleSlug) {
+            $docUrl = match ($log->module) {
+                'Penjualan' => '/sales',
+                'Pembelian' => '/purchasing',
+                'Inventori', 'Inventori & Gudang' => '/inventory',
+                'Keuangan' => '/finance',
+                'SDM & Payroll', 'SDM & Cuti' => '/hrm',
+                default => '/settings',
+            };
+
+            // DASH-05 & T-R10: Redaksi email dan IP dari deskripsi & document_number untuk peran non-admin
+            $desc = (string) $log->description;
+            $docNum = $log->document_number;
+            if ($roleSlug !== 'admin') {
+                $desc = preg_replace('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', '[redacted]', $desc);
+                $desc = preg_replace('/\b\d{1,3}(?:\.\d{1,3}){3}\b/', '[redacted]', $desc);
+                if ($docNum && str_contains($docNum, '@')) {
+                    $docNum = null;
+                }
+            }
+
+            return [
+                'id' => $log->id,
+                'user_name' => $log->user_name,
+                'module' => $log->module,
+                'action' => $log->action,
+                'document_number' => $docNum,
+                'description' => $desc,
+                'relative_time' => $log->created_at ? Carbon::parse($log->created_at)->locale('id')->diffForHumans() : 'Baru saja',
+                'url' => $docUrl,
+            ];
+        })->values()->all();
+    }
+
     private function buildCalendarEvents($overdueReceivables, $openPayables): array
     {
         $events = [];
 
-        // Real invoice due dates (UI-11)
         foreach ($overdueReceivables->take(2) as $ar) {
             $dt = Carbon::parse($ar['due_date'])->locale('id');
             $jtShort = round($ar['balance_due'] / 1000000, 1);
@@ -567,7 +710,6 @@ class DashboardController extends Controller
             ];
         }
 
-        // Combined national holidays + H+1 shift rule (UI-11 & T-D06)
         $events[] = [
             'date_badge' => '24–25 Des',
             'title' => 'Hari Raya & Cuti Bersama Natal',
@@ -584,172 +726,5 @@ class DashboardController extends Controller
         ];
 
         return $events;
-    }
-
-    private function collectPendingApprovals(): array
-    {
-        $items = [];
-        $user = Auth::user();
-
-        $calcAge = function ($dateVal) {
-            if (! $dateVal) {
-                return ['days' => 1, 'label' => '1 hari menunggu'];
-            }
-            $d = max(1, (int) Carbon::parse($dateVal)->startOfDay()->diffInDays(now()->startOfDay()));
-            return ['days' => $d, 'label' => "{$d} hari menunggu"];
-        };
-
-        foreach (SalesOrder::with(['customer', 'creator', 'items.product', 'deliveries', 'invoices'])->where('status', 'Diajukan')->get() as $so) {
-            $age = $calcAge($so->order_date);
-            $items[] = [
-                'category' => 'SO',
-                'module' => 'Penjualan',
-                'doc_id' => $so->id,
-                'doc_number' => $so->so_number,
-                'partner' => $so->customer?->name ?? '-',
-                'date' => $so->order_date?->format('Y-m-d'),
-                'age_days' => $age['days'],
-                'age_label' => $age['label'],
-                'amount' => (float) $so->grand_total,
-                'reason' => $so->exceeds_credit_limit ? 'Melebihi Batas Kredit Pelanggan' : 'Melebihi Ambang Nilai SO',
-                'requester' => $so->creator?->name ?? 'Sales',
-                'notes' => $so->notes,
-                'detail_url' => '/sales?highlight=' . $so->id,
-                'can_approve' => $user ? $user->hasPermission('sales.approve') : false,
-                'mini_trail' => [
-                    ['label' => 'SO', 'done' => true],
-                    ['label' => 'Setuju', 'done' => false, 'current' => true],
-                    ['label' => 'Kirim', 'done' => false],
-                    ['label' => 'Faktur', 'done' => false],
-                ],
-                'lines_preview' => $so->items->map(fn ($i) => [
-                    'name' => $i->product?->name ?? '-',
-                    'qty' => $i->qty,
-                    'price' => $i->unit_price,
-                    'subtotal' => $i->subtotal,
-                ]),
-            ];
-        }
-
-        foreach (PurchaseOrder::with(['supplier', 'creator', 'items.product'])->where('status', 'Diajukan')->get() as $po) {
-            $age = $calcAge($po->order_date);
-            $items[] = [
-                'category' => 'PO',
-                'module' => 'Pembelian',
-                'doc_id' => $po->id,
-                'doc_number' => $po->po_number,
-                'partner' => $po->supplier?->name ?? '-',
-                'date' => $po->order_date?->format('Y-m-d'),
-                'age_days' => $age['days'],
-                'age_label' => $age['label'],
-                'amount' => (float) $po->grand_total,
-                'reason' => 'Nilai PO di atas ambang persetujuan (Rp 25.000.000)',
-                'requester' => $po->creator?->name ?? 'Purchasing',
-                'notes' => $po->notes,
-                'detail_url' => '/purchasing?highlight=' . $po->id,
-                'can_approve' => $user ? $user->hasPermission('purchasing.approve') : false,
-                'mini_trail' => [
-                    ['label' => $po->doc_type, 'done' => true],
-                    ['label' => 'Setuju', 'done' => false, 'current' => true],
-                    ['label' => 'GRN', 'done' => false],
-                    ['label' => 'Faktur', 'done' => false],
-                ],
-                'lines_preview' => $po->items->map(fn ($i) => [
-                    'name' => $i->product?->name ?? '-',
-                    'qty' => $i->qty,
-                    'price' => $i->unit_price,
-                    'subtotal' => $i->subtotal,
-                ]),
-            ];
-        }
-
-        foreach (StockOpname::with(['warehouse', 'creator', 'items.product'])->where('status', 'Diajukan')->get() as $opn) {
-            $diffVal = $opn->items->sum('difference_value');
-            $age = $calcAge($opn->opname_date);
-            $items[] = [
-                'category' => 'OPNAME',
-                'module' => 'Inventori',
-                'doc_id' => $opn->id,
-                'doc_number' => $opn->opname_number,
-                'partner' => $opn->warehouse?->name ?? '-',
-                'date' => $opn->opname_date?->format('Y-m-d'),
-                'age_days' => $age['days'],
-                'age_label' => $age['label'],
-                'amount' => abs((float) $diffVal),
-                'reason' => 'Penyesuaian Selisih Fisik Stok Opname',
-                'requester' => $opn->creator?->name ?? 'Staf Gudang',
-                'notes' => $opn->notes,
-                'detail_url' => '/inventory?tab=opnames',
-                'can_approve' => $user ? $user->hasPermission('inventory.approve') : false,
-                'mini_trail' => [
-                    ['label' => 'Hitung Fisik', 'done' => true],
-                    ['label' => 'Setuju', 'done' => false, 'current' => true],
-                    ['label' => 'Jurnal Selisih', 'done' => false],
-                ],
-                'lines_preview' => $opn->items->map(fn ($i) => [
-                    'name' => $i->product?->name ?? '-',
-                    'qty' => "Fisik: {$i->physical_qty} (Selisih: {$i->difference_qty})",
-                    'price' => $i->unit_cost,
-                    'subtotal' => $i->difference_value,
-                ]),
-            ];
-        }
-
-        foreach (Leave::with('employee')->where('status', 'Diajukan')->get() as $lv) {
-            $age = $calcAge($lv->created_at ?: $lv->start_date);
-            $items[] = [
-                'category' => 'LEAVE',
-                'module' => 'SDM & Cuti',
-                'doc_id' => $lv->id,
-                'doc_number' => $lv->leave_number,
-                'partner' => $lv->employee?->name ?? '-',
-                'date' => $lv->start_date?->format('Y-m-d'),
-                'age_days' => $age['days'],
-                'age_label' => $age['label'],
-                'amount' => (float) $lv->days_count,
-                'reason' => "{$lv->leave_type} ({$lv->days_count} Hari)",
-                'requester' => $lv->employee?->name ?? '-',
-                'notes' => $lv->reason,
-                'detail_url' => '/hrm?tab=leaves',
-                'can_approve' => $user ? $user->hasPermission('hrm.approve') : false,
-                'mini_trail' => [
-                    ['label' => 'Pengajuan', 'done' => true],
-                    ['label' => 'Setuju HR', 'done' => false, 'current' => true],
-                    ['label' => 'Kuota Cuti', 'done' => false],
-                ],
-                'lines_preview' => [],
-            ];
-        }
-
-        foreach (PayrollRun::where('status', 'Diajukan')->get() as $prl) {
-            $age = $calcAge($prl->process_date);
-            $items[] = [
-                'category' => 'PAYROLL',
-                'module' => 'Payroll',
-                'doc_id' => $prl->id,
-                'doc_number' => $prl->payroll_number,
-                'partner' => "Periode {$prl->period_name} ({$prl->employee_count} Karyawan)",
-                'date' => $prl->process_date?->format('Y-m-d'),
-                'age_days' => $age['days'],
-                'age_label' => $age['label'],
-                'amount' => (float) $prl->total_net_pay,
-                'reason' => 'Persetujuan Pembekuan Payroll & Posting Jurnal Gaji',
-                'requester' => 'Staf HR',
-                'notes' => 'Total Bruto: Rp ' . number_format($prl->total_gross, 0, ',', '.'),
-                'detail_url' => '/hrm?tab=payroll',
-                'can_approve' => $user ? $user->hasPermission('hrm.approve') : false,
-                'mini_trail' => [
-                    ['label' => 'Hitung Gaji', 'done' => true],
-                    ['label' => 'Otorisasi', 'done' => false, 'current' => true],
-                    ['label' => 'Jurnal & Slip', 'done' => false],
-                ],
-                'lines_preview' => [],
-            ];
-        }
-
-        // UI-04 & 15.4: Urutkan persetujuan dari umur terlama
-        usort($items, fn ($a, $b) => ($b['age_days'] ?? 0) <=> ($a['age_days'] ?? 0));
-
-        return $items;
     }
 }

@@ -43,6 +43,7 @@ const props = defineProps({
 const page = usePage();
 const user = computed(() => page.props.auth?.user);
 const demoUsers = computed(() => page.props.auth?.demo_users || []);
+const canSwitchRole = computed(() => !!page.props.auth?.can_switch_role);
 const company = computed(() => page.props.company);
 const notifications = computed(() => page.props.notifications || { unread_count: 0, items: [], inline_approvals: [] });
 const pendingApprovalsCount = computed(() => page.props.pending_approvals_count || 0);
@@ -79,7 +80,7 @@ const navGroups = computed(() => {
             items: [
                 { name: 'Hari Ini', href: '/dashboard', icon: LayoutGrid, perm: 'dashboard.view', barColor: '#1D4ED8' },
                 {
-                    name: 'Persetujuan',
+                    name: user.value?.has_approval_authority ? 'Persetujuan' : 'Pengajuan Saya',
                     href: '/approvals',
                     icon: CheckSquare,
                     perm: 'dashboard.view',
@@ -189,14 +190,17 @@ watch(searchQuery, (val) => {
     }, 150);
 });
 
-const quickMenuLinks = [
-    { category: 'Pintasan', title: 'Papan Hari Ini (Tindakan Prioritas)', subtitle: 'Utama', url: '/dashboard' },
-    { category: 'Pintasan', title: 'Buat Pesanan Penjualan (SO)', subtitle: 'Penjualan', url: '/sales' },
-    { category: 'Pintasan', title: 'Buat Purchase Order (PO)', subtitle: 'Pembelian', url: '/purchasing' },
-    { category: 'Pintasan', title: 'Kartu Stok & Opname Gudang', subtitle: 'Inventori', url: '/inventory' },
-    { category: 'Pintasan', title: 'Buku Besar & Jurnal Umum', subtitle: 'Keuangan', url: '/finance' },
-    { category: 'Pintasan', title: 'Perhitungan Payroll Bulanan', subtitle: 'SDM & Payroll', url: '/hrm' },
-];
+const quickMenuLinks = computed(() =>
+    [
+        { category: 'Pintasan', title: 'Papan Hari Ini', subtitle: 'Utama', url: '/dashboard', perm: 'dashboard.view' },
+        { category: 'Pintasan', title: 'Portal Karyawan (Cuti & Slip Gaji)', subtitle: 'SDM', url: '/hrm/portal', perm: 'has_employee' },
+        { category: 'Pintasan', title: 'Buat Pesanan Penjualan (SO)', subtitle: 'Penjualan', url: '/sales', perm: 'sales.view' },
+        { category: 'Pintasan', title: 'Buat Purchase Order (PO)', subtitle: 'Pembelian', url: '/purchasing', perm: 'purchasing.view' },
+        { category: 'Pintasan', title: 'Kartu Stok & Opname Gudang', subtitle: 'Inventori', url: '/inventory', perm: 'inventory.view' },
+        { category: 'Pintasan', title: 'Buku Besar & Jurnal Umum', subtitle: 'Keuangan', url: '/finance', perm: 'finance.view' },
+        { category: 'Pintasan', title: 'Perhitungan Payroll Bulanan', subtitle: 'SDM & Payroll', url: '/hrm', perm: 'hrm.view' },
+    ].filter((item) => hasPerm(item.perm))
+);
 
 const goToResult = (url) => {
     showCommandPalette.value = false;
@@ -396,25 +400,27 @@ onUnmounted(() => {
                     v-if="showRoleDropdown"
                     class="absolute bottom-14 left-2 w-60 rounded-[6px] bg-white dark:bg-[#161B22] shadow-lg border border-slate-200 dark:border-slate-800 py-1 z-50"
                 >
-                    <div class="px-3 py-1.5 border-b border-slate-100 dark:border-slate-800 text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
-                        Beralih Peran Pengguna
-                    </div>
-                    <div class="max-h-60 overflow-y-auto py-0.5">
-                        <button
-                            v-for="du in demoUsers"
-                            :key="du.id"
-                            type="button"
-                            @click="switchDemoRole(du.id)"
-                            class="w-full px-3 py-1.5 text-left text-xs hover:bg-[#F6F8FA] dark:hover:bg-slate-800 flex items-center justify-between gap-2"
-                        >
-                            <div class="min-w-0">
-                                <div class="truncate font-medium text-slate-800 dark:text-slate-200">{{ du.name }}</div>
-                                <div class="text-[10px] text-slate-500 truncate">{{ du.role_name }}</div>
-                            </div>
-                            <Check v-if="du.id === user?.id" class="w-3.5 h-3.5 text-[#1D4ED8] shrink-0" />
-                        </button>
-                    </div>
-                    <div class="border-t border-slate-100 dark:border-slate-800 mt-0.5 pt-0.5">
+                    <template v-if="canSwitchRole && demoUsers.length > 0">
+                        <div class="px-3 py-1.5 border-b border-slate-100 dark:border-slate-800 text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
+                            Beralih Peran Pengguna
+                        </div>
+                        <div class="max-h-60 overflow-y-auto py-0.5">
+                            <button
+                                v-for="du in demoUsers"
+                                :key="du.id"
+                                type="button"
+                                @click="switchDemoRole(du.id)"
+                                class="w-full px-3 py-1.5 text-left text-xs hover:bg-[#F6F8FA] dark:hover:bg-slate-800 flex items-center justify-between gap-2"
+                            >
+                                <div class="min-w-0">
+                                    <div class="truncate font-medium text-slate-800 dark:text-slate-200">{{ du.name }}</div>
+                                    <div class="text-[10px] text-slate-500 truncate">{{ du.role_name }}</div>
+                                </div>
+                                <Check v-if="du.id === user?.id" class="w-3.5 h-3.5 text-[#1D4ED8] shrink-0" />
+                            </button>
+                        </div>
+                    </template>
+                    <div :class="canSwitchRole && demoUsers.length > 0 ? 'border-t border-slate-100 dark:border-slate-800 mt-0.5 pt-0.5' : ''">
                         <Link
                             href="/logout"
                             method="post"

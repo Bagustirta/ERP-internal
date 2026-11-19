@@ -58,9 +58,9 @@ class ErpQaAndInvariantsTest extends TestCase
      */
     public function test_dashboard_v03_loads_without_lazy_loading_and_has_expected_widgets(): void
     {
-        $admin = User::where('email', 'admin@erp.local')->firstOrFail();
+        $manager = User::where('email', 'manager@erp.local')->firstOrFail();
 
-        $response = $this->actingAs($admin)->get('/dashboard');
+        $response = $this->actingAs($manager)->get('/dashboard');
         $response->assertStatus(200);
 
         $page = $response->viewData('page');
