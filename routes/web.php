@@ -89,17 +89,19 @@ Route::middleware('auth')->group(function () {
         Route::post('/finance/fiscal-periods/{fiscalPeriod}/toggle', [FinanceController::class, 'toggleFiscalPeriod'])->name('finance.periods.toggle');
     });
 
-    // SDM & Payroll + Portal Karyawan
+    // Portal Karyawan Self-Service (tersedia untuk seluruh pengguna yang login; data selalu dibatasi ke user_id sendiri)
+    Route::get('/hrm/portal', [HrmController::class, 'portal'])->name('hrm.portal');
+    Route::post('/hrm/leaves', [HrmController::class, 'storeLeave'])->name('hrm.leaves.store');
+    Route::get('/hrm/payslips/{payslip}/print', [HrmController::class, 'printPayslip'])->name('hrm.payslips.print');
+
+    // SDM & Payroll (Manajemen SDM Administratif)
     Route::middleware(CheckModulePermission::class.':hrm.view')->group(function () {
         Route::get('/hrm', [HrmController::class, 'index'])->name('hrm.index');
         Route::post('/hrm/employees', [HrmController::class, 'storeEmployee'])->name('hrm.employees.store');
         Route::post('/hrm/attendances', [HrmController::class, 'storeAttendance'])->name('hrm.attendances.store');
-        Route::post('/hrm/leaves', [HrmController::class, 'storeLeave'])->name('hrm.leaves.store');
         Route::post('/hrm/payroll/run', [HrmController::class, 'runPayroll'])->name('hrm.payroll.run');
         Route::post('/hrm/payroll/{payrollRun}/approve', [HrmController::class, 'approvePayroll'])->name('hrm.payroll.approve');
         Route::post('/hrm/payroll/{payrollRun}/pay', [HrmController::class, 'payPayroll'])->name('hrm.payroll.pay');
-        Route::get('/hrm/portal', [HrmController::class, 'portal'])->name('hrm.portal');
-        Route::get('/hrm/payslips/{payslip}/print', [HrmController::class, 'printPayslip'])->name('hrm.payslips.print');
     });
 
     // Laporan & Analitik

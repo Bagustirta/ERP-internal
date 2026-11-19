@@ -164,19 +164,70 @@ class HrmController extends Controller
     public function storeLeave(Request $request)
     {
         $data = $request->validate([
-            'employee_id' => 'required|exists:employees,id',
+            'employee_id' => 'nullable|exists:employees,id',
             'leave_type' => 'required|string',
             'start_date' => 'required|date',
             'end_date' => 'required|date|after_or_equal:start_date',
             'reason' => 'required|string',
+            'from_portal' => 'nullable|boolean',
+        ], [
+            'end_date.after_or_equal' => 'Tanggal selesai cuti tidak boleh sebelum tanggal mulai.',
         ]);
 
-        $days = Carbon::parse($data['start_date'])->diffInDays(Carbon::parse($data['end_date'])) + 1;
+        $user = $request->user();
+        $ownEmployee = Employee::where('user_id', $user->id)->first();
+        $isHrOrAdmin = $user && ($user->hasRole('admin') || $user->hasRole('hr'));
+
+        // HRM-FIX-04 & T-P03: Pengajuan cuti dari portal selalu memakai karyawan milik pengguna login;
+        // request dengan employee_id orang lain ditolak 403 untuk pengguna biasa atau bila dari portal
+        if ($request->boolean('from_portal') || ! $isHrOrAdmin) {
+            if (! $ownEmployee) {
+                abort(403, 'Akun Anda belum terhubung dengan profil karyawan sehingga tidak dapat mengajukan cuti.');
+            }
+            if (! empty($data['employee_id']) && (int) $data['employee_id'] !== (int) $ownEmployee->id) {
+                AuditLogService::log('Keamanan', 'IDOR_BLOCKED', 'LEAVE-REQ', "Percobaan pengajuan cuti atas nama employee_id={$data['employee_id']} oleh {$user->email}");
+                abort(403, 'Akses Ditolak (HRM-FIX-04): Anda hanya dapat mengajukan cuti atas nama diri sendiri.');
+            }
+            $targetEmployee = $ownEmployee;
+        } else {
+            $targetEmployee = ! empty($data['employee_id'])
+                ? Employee::findOrFail($data['employee_id'])
+                : $ownEmployee;
+            if (! $targetEmployee) {
+                return back()->withErrors(['employee_id' => 'Pilih karyawan yang akan diajukan cutinya.']);
+            }
+        }
+
+        // T-P08: Profil karyawan nonaktif tidak dapat mengajukan cuti baru
+        if (! $targetEmployee->is_active) {
+            return back()->withErrors(['leave_type' => 'Profil karyawan Anda berstatus nonaktif dan tidak dapat mengajukan cuti baru.']);
+        }
+
+        // 6.2: Hitung hari kerja terpotong (memperhitungkan akhir pekan & hari libur nasional)
+        $holidays = ['2026-12-24', '2026-12-25', '2027-01-01'];
+        $cursor = Carbon::parse($data['start_date'])->startOfDay();
+        $end = Carbon::parse($data['end_date'])->startOfDay();
+        $workingDays = 0;
+        while ($cursor->lte($end)) {
+            if (! $cursor->isWeekend() && ! in_array($cursor->toDateString(), $holidays, true)) {
+                $workingDays++;
+            }
+            $cursor->addDay();
+        }
+        $days = max(1, $workingDays);
+
+        // T-P09: Validasi sisa kuota cuti tahunan
+        if ($data['leave_type'] === 'Cuti Tahunan' && $days > (int) $targetEmployee->annual_leave_quota) {
+            return back()->withErrors([
+                'end_date' => "Jumlah hari kerja cuti ({$days} hari) melebihi sisa kuota cuti tahunan Anda ({$targetEmployee->annual_leave_quota} hari).",
+            ]);
+        }
+
         $leaveNum = DocumentNumberService::generate('LV', 'CUTI', $data['start_date']);
 
         $leave = Leave::create([
             'leave_number' => $leaveNum,
-            'employee_id' => $data['employee_id'],
+            'employee_id' => $targetEmployee->id,
             'leave_type' => $data['leave_type'],
             'start_date' => $data['start_date'],
             'end_date' => $data['end_date'],
@@ -185,15 +236,15 @@ class HrmController extends Controller
             'status' => 'Diajukan',
         ]);
 
-        AuditLogService::log('SDM & Payroll', 'REQUEST_LEAVE', $leaveNum, "Pengajuan {$leave->leave_type} selama {$days} hari");
+        AuditLogService::log('SDM & Payroll', 'REQUEST_LEAVE', $leaveNum, "Pengajuan {$leave->leave_type} atas nama {$targetEmployee->name} selama {$days} hari kerja");
         AuditLogService::notify(
             "Pengajuan Cuti Baru: {$leaveNum}",
-            "Pengajuan {$leave->leave_type} ({$days} hari) menunggu persetujuan.",
+            "Pengajuan {$leave->leave_type} ({$days} hari kerja) oleh {$targetEmployee->name} menunggu persetujuan.",
             'approval',
             '/approvals'
         );
 
-        return back()->with('success', "Pengajuan cuti {$leaveNum} berhasil diajukan dan menunggu persetujuan atasan.");
+        return back()->with('success', "Pengajuan cuti {$leaveNum} ({$days} hari kerja) berhasil diajukan dan menunggu persetujuan atasan.");
     }
 
     /**
@@ -260,27 +311,45 @@ class HrmController extends Controller
     }
 
     /**
-     * Portal Karyawan (ramah ponsel untuk lihat slip gaji PDF & pengajuan cuti) - PRD 4.8
+     * Portal Karyawan (Self-Service) - PRD Perbaikan Portal Karyawan (HRM-FIX-01, HRM-FIX-02, HRM-FIX-03, T-P01, T-P02, T-P08, T-P11)
+     * - HANYA mencari Employee berdasarkan user_id pengguna login (TANPA fallback Employee::first()).
+     * - Tidak menerima ID karyawan dari URL/request.
+     * - Tidak mengirim daftar karyawan lain (allEmployees) ke Inertia.
      */
     public function portal(Request $request)
     {
         $user = $request->user();
-        $canViewAll = $user && ($user->hasRole('admin') || $user->hasRole('hr') || $user->hasRole('manager'));
-        $employee = Employee::where('user_id', $user->id)->first() ?: ($canViewAll ? Employee::first() : null);
+        $employee = Employee::where('user_id', $user->id)->first();
 
-        $payslips = $employee
-            ? Payslip::with(['payrollRun', 'employee'])->where('employee_id', $employee->id)->latest()->get()
-            : collect();
+        if (! $employee) {
+            AuditLogService::log(
+                'SDM & Payroll',
+                'PORTAL_NO_PROFILE',
+                $user->email,
+                "Pengguna {$user->name} membuka Portal Karyawan namun akun belum terhubung dengan profil karyawan"
+            );
 
-        $leaves = $employee
-            ? Leave::with('approver')->where('employee_id', $employee->id)->latest()->get()
-            : collect();
+            return Inertia::render('Hrm/Portal', [
+                'employee' => null,
+                'canManageHrm' => $user->hasRole('admin') || $user->hasRole('hr') || $user->hasPermission('hrm.create'),
+                'payslips' => [],
+                'leaves' => [],
+            ]);
+        }
+
+        $payslips = Payslip::with(['payrollRun', 'employee'])
+            ->where('employee_id', $employee->id)
+            ->latest()
+            ->get();
+
+        $leaves = Leave::with('approver')
+            ->where('employee_id', $employee->id)
+            ->latest()
+            ->get();
 
         return Inertia::render('Hrm/Portal', [
             'employee' => $employee,
-            'allEmployees' => $canViewAll
-                ? Employee::orderBy('name')->get(['id', 'emp_code', 'name', 'department', 'position'])
-                : ($employee ? collect([$employee->only(['id', 'emp_code', 'name', 'department', 'position'])]) : collect()),
+            'canManageHrm' => $user->hasRole('admin') || $user->hasRole('hr') || $user->hasPermission('hrm.create'),
             'payslips' => $payslips,
             'leaves' => $leaves,
         ]);
@@ -290,16 +359,28 @@ class HrmController extends Controller
     {
         $payslip->load(['employee', 'payrollRun']);
 
-        // Bagian 4.3 #6, 5.2, S-01: Pencegahan IDOR pada Slip Gaji — Pengguna biasa hanya boleh melihat slip gajinya sendiri
+        // HRM-FIX-05, T-P04, T-P05: Pencegahan IDOR + Pencatatan Audit PAYSLIP_VIEWED_BY_OTHER bila HR/Admin melihat slip karyawan lain
         $user = $request->user();
+        $isOwner = (int) $payslip->employee?->user_id === (int) $user?->id;
         $canViewAllPayroll = $user && ($user->hasRole('admin') || $user->hasRole('manager') || $user->hasRole('hr') || $user->hasRole('finance'));
-        if (! $canViewAllPayroll && (int) $payslip->employee?->user_id !== (int) $user?->id) {
+
+        if (! $isOwner && ! $canViewAllPayroll) {
             AuditLogService::log('Keamanan', 'IDOR_BLOCKED', $payslip->payslip_number, "Percobaan akses tidak sah (IDOR) ke slip gaji {$payslip->payslip_number} oleh {$user?->email}");
             abort(403, 'Akses Ditolak (IDOR S-01): Anda tidak berhak mengakses slip gaji milik karyawan lain.');
         }
 
+        if (! $isOwner && $canViewAllPayroll) {
+            AuditLogService::log(
+                'SDM & Payroll',
+                'PAYSLIP_VIEWED_BY_OTHER',
+                $payslip->payslip_number,
+                "Pengguna {$user->name} ({$user->role?->name}) membuka slip gaji milik {$payslip->employee?->name} ({$payslip->employee?->emp_code})"
+            );
+        }
+
         return Inertia::render('Hrm/PayslipPrint', [
             'payslip' => $payslip,
+            'viewedByOther' => ! $isOwner,
         ]);
     }
 }

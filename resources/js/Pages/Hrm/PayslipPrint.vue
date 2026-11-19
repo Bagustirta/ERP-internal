@@ -6,6 +6,7 @@ import DocumentTrailPanel from '@/Components/DocumentTrailPanel.vue';
 
 const props = defineProps({
     payslip: Object,
+    viewedByOther: Boolean,
 });
 
 const page = usePage();
@@ -50,6 +51,14 @@ const payslipTrailSteps = computed(() => {
     <Head :title="`Slip Gaji ${payslip.payslip_number}`" />
 
     <div class="min-h-screen bg-[#f5f5f3] py-6 px-4">
+        <!-- 6.3 Banner audit saat HR/Admin melihat data gaji milik karyawan lain -->
+        <div
+            v-if="viewedByOther"
+            class="no-print max-w-6xl mx-auto mb-3 px-3.5 py-2 rounded-[6px] bg-amber-50 border border-amber-200 text-amber-900 text-xs font-medium"
+        >
+            Anda melihat data gaji milik <strong>{{ payslip.employee?.name }}</strong> (<span class="doc-code">{{ payslip.employee?.emp_code }}</span>). Akses ini dicatat pada log audit (PAYSLIP_VIEWED_BY_OTHER).
+        </div>
+
         <div class="no-print max-w-6xl mx-auto mb-4 flex items-center justify-between">
             <Link href="/hrm?tab=payroll" class="px-3 py-1.5 rounded-[5px] bg-white border border-zinc-300 text-xs font-medium">
                 ← Kembali ke Payroll

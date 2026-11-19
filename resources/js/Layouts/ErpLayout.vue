@@ -64,6 +64,7 @@ const isSearching = ref(false);
 const searchInputRef = ref(null);
 
 const hasPerm = (perm) => {
+    if (!perm) return !!user.value;
     if (!user.value) return false;
     if (user.value.role?.slug === 'admin') return true;
     return (user.value.permissions || []).includes(perm);
@@ -100,7 +101,7 @@ const navGroups = computed(() => {
             items: [
                 { name: 'Keuangan & Buku Besar', href: '/finance', icon: Landmark, perm: 'finance.view', barColor: '#4F46E5' },
                 { name: 'SDM & Payroll', href: '/hrm', icon: Users, perm: 'hrm.view', barColor: '#059669' },
-                { name: 'Portal Karyawan', href: '/hrm/portal', icon: UserCheck, perm: 'hrm.view', barColor: '#059669' },
+                { name: 'Portal Karyawan', href: '/hrm/portal', icon: UserCheck, perm: null, barColor: '#059669' },
                 { name: 'Laporan & Analitik', href: '/reports', icon: BarChart2, perm: 'reports.view', barColor: '#0284C7' },
             ],
         },
