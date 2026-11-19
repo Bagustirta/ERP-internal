@@ -133,14 +133,34 @@ class DatabaseSeeder extends Seeder
             }
         }
 
+        // Izin khusus sensitif SDM (Bagian 12.1 K3, K4, 12.3, HRM-FIX-12, HRM-FIX-16)
+        $allPermissions['hrm.payslip.view_all'] = Permission::create([
+            'module' => 'hrm',
+            'action' => 'payslip.view_all',
+            'slug' => 'hrm.payslip.view_all',
+            'name' => 'Lihat Slip Gaji & Rincian Payroll Semua Karyawan',
+        ]);
+        $allPermissions['hrm.employee.link_user'] = Permission::create([
+            'module' => 'hrm',
+            'action' => 'employee.link_user',
+            'slug' => 'hrm.employee.link_user',
+            'name' => 'Tautkan Akun Pengguna ke Profil Karyawan',
+        ]);
+
+        // K3 & HRM-FIX-12: Admin Sistem TIDAK memiliki hrm.payslip.view_all & hrm.employee.link_user secara bawaan
+        $adminDefaultPerms = array_values(array_diff(
+            array_keys($allPermissions),
+            ['hrm.payslip.view_all', 'hrm.employee.link_user']
+        ));
+
         $rolesData = [
-            'admin' => ['name' => 'Admin Sistem', 'desc' => 'Kelola pengguna, peran, pengaturan, audit & akses penuh', 'perms' => array_keys($allPermissions)],
-            'manager' => ['name' => 'Manajer / Direksi', 'desc' => 'Dashboard ringkas, pusat persetujuan semua modul, laporan', 'perms' => array_filter(array_keys($allPermissions), fn ($s) => str_ends_with($s, '.view') || str_ends_with($s, '.approve') || str_ends_with($s, '.export'))],
+            'admin' => ['name' => 'Admin Sistem', 'desc' => 'Teknis, kelola pengguna, peran, pengaturan & audit (tanpa akses gaji orang lain bawaan)', 'perms' => $adminDefaultPerms],
+            'manager' => ['name' => 'Manajer / Direksi', 'desc' => 'Dashboard ringkas, pusat persetujuan semua modul, laporan', 'perms' => array_merge(array_filter(array_keys($allPermissions), fn ($s) => str_ends_with($s, '.view') || str_ends_with($s, '.approve') || str_ends_with($s, '.export')), ['hrm.payslip.view_all'])],
             'sales' => ['name' => 'Staf Penjualan', 'desc' => 'Buat penawaran, pesanan penjualan (SO), faktur, pantau piutang', 'perms' => ['dashboard.view', 'master.view', 'master.create', 'sales.view', 'sales.create', 'sales.edit', 'sales.export', 'inventory.view', 'reports.view', 'reports.export']],
             'purchasing' => ['name' => 'Staf Pembelian', 'desc' => 'Buat permintaan & PO, terima barang, pantau hutang pemasok', 'perms' => ['dashboard.view', 'master.view', 'master.create', 'purchasing.view', 'purchasing.create', 'purchasing.edit', 'purchasing.export', 'inventory.view', 'reports.view', 'reports.export']],
             'warehouse' => ['name' => 'Staf Gudang', 'desc' => 'Penerimaan barang (GRN), surat jalan, transfer, stok opname', 'perms' => ['dashboard.view', 'master.view', 'inventory.view', 'inventory.create', 'inventory.edit', 'inventory.export', 'sales.view', 'purchasing.view', 'reports.view']],
-            'finance' => ['name' => 'Staf Keuangan', 'desc' => 'COA, jurnal, kas dan bank, rekonsiliasi, laporan keuangan', 'perms' => ['dashboard.view', 'master.view', 'finance.view', 'finance.create', 'finance.edit', 'finance.approve', 'finance.export', 'sales.view', 'sales.create', 'purchasing.view', 'purchasing.create', 'reports.view', 'reports.export']],
-            'hr' => ['name' => 'Staf HR', 'desc' => 'Data karyawan, absensi, cuti, proses payroll & slip gaji', 'perms' => ['dashboard.view', 'hrm.view', 'hrm.create', 'hrm.edit', 'hrm.approve', 'hrm.export', 'reports.view', 'reports.export']],
+            'finance' => ['name' => 'Staf Keuangan', 'desc' => 'COA, jurnal, kas dan bank, rekonsiliasi, laporan keuangan', 'perms' => ['dashboard.view', 'master.view', 'finance.view', 'finance.create', 'finance.edit', 'finance.approve', 'finance.export', 'sales.view', 'sales.create', 'purchasing.view', 'purchasing.create', 'reports.view', 'reports.export', 'hrm.payslip.view_all']],
+            'hr' => ['name' => 'Staf HR', 'desc' => 'Data karyawan, absensi, cuti, proses payroll & slip gaji', 'perms' => ['dashboard.view', 'hrm.view', 'hrm.create', 'hrm.edit', 'hrm.approve', 'hrm.export', 'hrm.payslip.view_all', 'hrm.employee.link_user', 'reports.view', 'reports.export']],
             'employee' => ['name' => 'Karyawan', 'desc' => 'Portal karyawan: lihat slip gaji PDF & ajukan cuti', 'perms' => ['dashboard.view', 'hrm.view', 'hrm.create']],
         ];
 

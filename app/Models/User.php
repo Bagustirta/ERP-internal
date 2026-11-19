@@ -48,17 +48,28 @@ class User extends Authenticatable
         return in_array($this->role->slug, (array) $slugs, true);
     }
 
+    /**
+     * K3 & HRM-FIX-12: Admin Sistem TIDAK otomatis memiliki izin sensitif gaji/payroll (hrm.payslip.view_all)
+     * maupun izin penautan karyawan (hrm.employee.link_user) secara bawaan. Izin sensitif harus diberikan eksplisit.
+     */
     public function hasPermission(string $permissionSlug): bool
     {
-        if ($this->hasRole('admin')) {
-            return true;
-        }
         if (! $this->relationLoaded('role') || ($this->role && ! $this->role->relationLoaded('permissions'))) {
             $this->load('role.permissions');
         }
         if (! $this->role) {
             return false;
         }
+
+        $explicitOnlyPermissions = [
+            'hrm.payslip.view_all',
+            'hrm.employee.link_user',
+        ];
+
+        if ($this->hasRole('admin') && ! in_array($permissionSlug, $explicitOnlyPermissions, true)) {
+            return true;
+        }
+
         return $this->role->permissions->contains('slug', $permissionSlug);
     }
 }

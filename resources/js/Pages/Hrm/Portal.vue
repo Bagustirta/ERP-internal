@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue';
-import { Head, useForm, Link } from '@inertiajs/vue3';
+import { Head, useForm, Link, router } from '@inertiajs/vue3';
 import ErpLayout from '@/Layouts/ErpLayout.vue';
 import StatusBadge from '@/Components/StatusBadge.vue';
 import { formatRp, formatDate } from '@/utils/format';
@@ -8,10 +8,15 @@ import { UserX, AlertCircle, FileText, CalendarDays } from 'lucide-vue-next';
 
 const props = defineProps({
     employee: Object,
-    canManageHrm: Boolean,
+    canLinkEmployee: Boolean,
+    isSystemAdmin: Boolean,
     payslips: Array,
     leaves: Array,
 });
+
+const requestHrProfileLink = () => {
+    router.post('/hrm/portal/contact-hr', {}, { preserveScroll: true });
+};
 
 const leaveForm = useForm({
     leave_type: 'Cuti Tahunan',
@@ -62,7 +67,7 @@ const submitLeave = () => {
 
     <ErpLayout title="Portal Mandiri Karyawan (Slip Gaji PDF & Pengajuan Cuti)" :breadcrumbs="['SDM', 'Portal Karyawan']">
         <div class="max-w-3xl mx-auto space-y-4">
-            <!-- 6.1 EMPTY STATE: Pengguna tanpa profil karyawan (mis. Admin sistem murni) -->
+            <!-- 12.4 & HRM-FIX-14 EMPTY STATE BERDASARKAN PERAN & IZIN -->
             <div
                 v-if="!employee"
                 class="erp-card p-8 text-center space-y-3"
@@ -70,29 +75,67 @@ const submitLeave = () => {
                 <div class="w-11 h-11 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 flex items-center justify-center mx-auto">
                     <UserX class="w-5 h-5" />
                 </div>
-                <div class="space-y-1">
-                    <h2 class="text-sm font-bold text-slate-900 dark:text-white">
-                        Akun belum terhubung dengan profil karyawan
-                    </h2>
-                    <p class="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto">
-                        Slip gaji dan cuti hanya tampil untuk akun yang tertaut ke data karyawan.
-                    </p>
-                </div>
-                <div class="pt-2 flex flex-wrap items-center justify-center gap-2.5 text-xs">
-                    <a
-                        href="mailto:hr@nusantara-erp.co.id?subject=Penautan%20Profil%20Karyawan"
-                        class="px-3.5 py-2 rounded-[6px] erp-btn-primary font-semibold"
-                    >
-                        Hubungi HR
-                    </a>
-                    <Link
-                        v-if="canManageHrm"
-                        href="/hrm"
-                        class="px-3.5 py-2 rounded-[6px] border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-medium hover:bg-slate-50"
-                    >
-                        Tautkan ke profil karyawan
-                    </Link>
-                </div>
+
+                <!-- Kondisi A: Admin Sistem tanpa izin penautan SDM (12.4 & T-P13) -->
+                <template v-if="isSystemAdmin">
+                    <div class="space-y-1">
+                        <h2 class="text-sm font-bold text-slate-900 dark:text-white">
+                            Akun ini adalah akun sistem dan tidak memiliki profil karyawan
+                        </h2>
+                        <p class="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto">
+                            Peran Admin Sistem bersifat teknis dan dipisahkan dari status kepegawaian serta akses data gaji karyawan.
+                        </p>
+                    </div>
+                    <div class="pt-2 flex justify-center text-xs">
+                        <Link
+                            href="/settings"
+                            class="px-3.5 py-2 rounded-[6px] border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-medium hover:bg-slate-50"
+                        >
+                            Kembali ke Pengaturan & Bantuan
+                        </Link>
+                    </div>
+                </template>
+
+                <!-- Kondisi B: HR berizin penautan tanpa profil (12.4) -->
+                <template v-else-if="canLinkEmployee">
+                    <div class="space-y-1">
+                        <h2 class="text-sm font-bold text-slate-900 dark:text-white">
+                            Akun belum terhubung dengan profil karyawan
+                        </h2>
+                        <p class="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto">
+                            Slip gaji dan cuti hanya tampil untuk akun yang tertaut ke data karyawan.
+                        </p>
+                    </div>
+                    <div class="pt-2 flex justify-center text-xs">
+                        <Link
+                            href="/hrm"
+                            class="px-3.5 py-2 rounded-[6px] erp-btn-primary font-semibold"
+                        >
+                            Tautkan ke profil karyawan
+                        </Link>
+                    </div>
+                </template>
+
+                <!-- Kondisi C: Pengguna biasa tanpa profil (12.4 & HRM-FIX-18) -->
+                <template v-else>
+                    <div class="space-y-1">
+                        <h2 class="text-sm font-bold text-slate-900 dark:text-white">
+                            Akun belum terhubung dengan profil karyawan
+                        </h2>
+                        <p class="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto">
+                            Slip gaji dan cuti hanya tampil untuk akun yang tertaut ke data karyawan.
+                        </p>
+                    </div>
+                    <div class="pt-2 flex justify-center text-xs">
+                        <button
+                            type="button"
+                            @click="requestHrProfileLink"
+                            class="px-3.5 py-2 rounded-[6px] erp-btn-primary font-semibold cursor-pointer"
+                        >
+                            Hubungi HR
+                        </button>
+                    </div>
+                </template>
             </div>
 
             <!-- 6.2 KONDISI NORMAL / PROFIL NONAKTIF (Hanya data milik pengguna yang login) -->

@@ -24,29 +24,40 @@ class HrmController extends Controller
     public function index(Request $request)
     {
         $user = $request->user();
-        $canViewSensitivePayroll = $user && ($user->hasRole('admin') || $user->hasRole('manager') || $user->hasRole('hr') || $user->hasRole('finance'));
+        // K3, K4, HRM-FIX-12, T-P12: Akses data gaji & payroll orang lain HANYA untuk peran yang punya izin eksplisit hrm.payslip.view_all (Admin Sistem tidak punya bawaan)
+        $canViewSensitivePayroll = $user && $user->hasPermission('hrm.payslip.view_all');
+        $canViewDirectory = $user && ($user->hasPermission('hrm.view') && ! $user->hasRole('employee'));
 
-        // Bagian 5.7 & S-14: Untuk peran terbatas (employee/staf biasa), jangan kirim kolom sensitif (gaji, rekening, NPWP) ke frontend Inertia
         $employees = Employee::with(['attendances' => fn ($q) => $q->latest('work_date')->limit(10), 'leaves', 'payslips.payrollRun'])
-            ->when(! $canViewSensitivePayroll, fn ($q) => $q->where('user_id', $user?->id))
+            ->when(! $canViewDirectory, fn ($q) => $q->where('user_id', $user?->id))
             ->orderBy('emp_code')
             ->get()
             ->map(function ($emp) use ($canViewSensitivePayroll, $user) {
                 $arr = $emp->toArray();
-                if (! $canViewSensitivePayroll && (int) $emp->user_id !== (int) $user?->id) {
-                    unset($arr['base_salary'], $arr['transport_allowance'], $arr['meal_allowance'], $arr['position_allowance'], $arr['bank_account_number'], $arr['npwp'], $arr['nik']);
+                $isOwn = (int) $emp->user_id === (int) $user?->id;
+                if (! $canViewSensitivePayroll && ! $isOwn) {
+                    unset(
+                        $arr['base_salary'],
+                        $arr['transport_allowance'],
+                        $arr['meal_allowance'],
+                        $arr['position_allowance'],
+                        $arr['bank_account_number'],
+                        $arr['npwp'],
+                        $arr['nik'],
+                        $arr['payslips']
+                    );
                 }
                 return $arr;
             });
 
         $attendances = Attendance::with('employee')
-            ->when(! $canViewSensitivePayroll, fn ($q) => $q->whereHas('employee', fn ($eq) => $eq->where('user_id', $user?->id)))
+            ->when(! $canViewDirectory, fn ($q) => $q->whereHas('employee', fn ($eq) => $eq->where('user_id', $user?->id)))
             ->latest('work_date')
             ->limit(100)
             ->get();
 
         $leaves = Leave::with(['employee', 'approver'])
-            ->when(! $canViewSensitivePayroll, fn ($q) => $q->whereHas('employee', fn ($eq) => $eq->where('user_id', $user?->id)))
+            ->when(! $canViewDirectory, fn ($q) => $q->whereHas('employee', fn ($eq) => $eq->where('user_id', $user?->id)))
             ->latest()
             ->get();
 
@@ -329,9 +340,14 @@ class HrmController extends Controller
                 "Pengguna {$user->name} membuka Portal Karyawan namun akun belum terhubung dengan profil karyawan"
             );
 
+            // Bagian 12.4 & HRM-FIX-14: Kondisi empty state bergantung pada peran dan izin
+            $canLinkEmployee = $user->hasPermission('hrm.employee.link_user');
+            $isSystemAdmin = $user->hasRole('admin') && ! $canLinkEmployee;
+
             return Inertia::render('Hrm/Portal', [
                 'employee' => null,
-                'canManageHrm' => $user->hasRole('admin') || $user->hasRole('hr') || $user->hasPermission('hrm.create'),
+                'canLinkEmployee' => $canLinkEmployee,
+                'isSystemAdmin' => $isSystemAdmin,
                 'payslips' => [],
                 'leaves' => [],
             ]);
@@ -349,24 +365,51 @@ class HrmController extends Controller
 
         return Inertia::render('Hrm/Portal', [
             'employee' => $employee,
-            'canManageHrm' => $user->hasRole('admin') || $user->hasRole('hr') || $user->hasPermission('hrm.create'),
+            'canLinkEmployee' => $user->hasPermission('hrm.employee.link_user'),
+            'isSystemAdmin' => false,
             'payslips' => $payslips,
             'leaves' => $leaves,
         ]);
+    }
+
+    /**
+     * HRM-FIX-18: Tombol "Hubungi HR" benar-benar membuat notifikasi ke HR dan dicatat di log audit
+     */
+    public function contactHrForProfile(Request $request)
+    {
+        $user = $request->user();
+        AuditLogService::log(
+            'SDM & Payroll',
+            'CONTACT_HR_LINK_PROFILE',
+            $user->email,
+            "Pengguna {$user->name} ({$user->email}) meminta penautan akun ke profil karyawan melalui Portal Karyawan"
+        );
+        AuditLogService::notify(
+            "Permintaan Penautan Profil Karyawan: {$user->name}",
+            "Pengguna {$user->name} ({$user->email}) meminta agar akunnya ditautkan ke profil karyawan di Manajemen SDM.",
+            'hrm_request',
+            '/hrm',
+            null,
+            'hr'
+        );
+
+        return back()->with('success', 'Permintaan penautan profil karyawan telah dikirimkan ke tim HR.');
     }
 
     public function printPayslip(Request $request, Payslip $payslip)
     {
         $payslip->load(['employee', 'payrollRun']);
 
-        // HRM-FIX-05, T-P04, T-P05: Pencegahan IDOR + Pencatatan Audit PAYSLIP_VIEWED_BY_OTHER bila HR/Admin melihat slip karyawan lain
+        // K3, K4, HRM-FIX-12, T-P04, T-P05, T-P12:
+        // Hanya pemilik slip atau pengguna dengan izin eksplisit hrm.payslip.view_all yang boleh membuka slip.
+        // Admin Sistem tanpa hrm.payslip.view_all akan ditolak 403 dan dicatat di log audit.
         $user = $request->user();
         $isOwner = (int) $payslip->employee?->user_id === (int) $user?->id;
-        $canViewAllPayroll = $user && ($user->hasRole('admin') || $user->hasRole('manager') || $user->hasRole('hr') || $user->hasRole('finance'));
+        $canViewAllPayroll = $user && $user->hasPermission('hrm.payslip.view_all');
 
         if (! $isOwner && ! $canViewAllPayroll) {
-            AuditLogService::log('Keamanan', 'IDOR_BLOCKED', $payslip->payslip_number, "Percobaan akses tidak sah (IDOR) ke slip gaji {$payslip->payslip_number} oleh {$user?->email}");
-            abort(403, 'Akses Ditolak (IDOR S-01): Anda tidak berhak mengakses slip gaji milik karyawan lain.');
+            AuditLogService::log('Keamanan', 'IDOR_BLOCKED', $payslip->payslip_number, "Akses slip gaji ditolak ({$user?->role?->name}): {$user?->email} mencoba membuka {$payslip->payslip_number}");
+            abort(403, 'Akses Ditolak (K3/HRM-FIX-12): Anda tidak memiliki izin hrm.payslip.view_all untuk melihat slip gaji milik karyawan lain.');
         }
 
         if (! $isOwner && $canViewAllPayroll) {

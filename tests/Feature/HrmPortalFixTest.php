@@ -45,9 +45,9 @@ class HrmPortalFixTest extends TestCase
     }
 
     /**
-     * T-P02: Admin tanpa profil karyawan membuka portal -> Empty state (employee = null), tidak ada data karyawan lain + tercatat PORTAL_NO_PROFILE
+     * T-P02 & T-P13: Admin tanpa profil karyawan membuka portal -> Empty state akun sistem, tanpa tombol penautan + tercatat PORTAL_NO_PROFILE
      */
-    public function test_tp02_admin_without_employee_profile_sees_empty_state_not_other_employee(): void
+    public function test_tp02_and_tp13_admin_without_employee_profile_sees_system_account_empty_state(): void
     {
         $admin = User::where('email', 'admin@erp.local')->firstOrFail();
 
@@ -58,8 +58,36 @@ class HrmPortalFixTest extends TestCase
         $this->assertNull($props['employee']);
         $this->assertEmpty($props['payslips']);
         $this->assertEmpty($props['leaves']);
-        $this->assertTrue($props['canManageHrm']);
+        $this->assertTrue($props['isSystemAdmin']);
+        $this->assertFalse($props['canLinkEmployee']);
+        $this->assertNull($props['auth']['user']['employee_id']); // T-P14: Sidebar menyembunyikan menu Portal Karyawan
         $this->assertTrue(AuditLog::where('action', 'PORTAL_NO_PROFILE')->where('document_number', $admin->email)->exists());
+    }
+
+    /**
+     * T-P12 & T-P19: Admin Sistem tanpa izin hrm.payslip.view_all tidak boleh membuka slip gaji karyawan lain (403 + tercatat audit)
+     * dan halaman /hrm tidak memuat payrollRuns bagi Admin Sistem
+     */
+    public function test_tp12_and_tp19_system_admin_cannot_view_other_employees_payslip_or_payroll(): void
+    {
+        $admin = User::where('email', 'admin@erp.local')->firstOrFail();
+        $directorSlip = Payslip::firstOrFail();
+
+        // Admin Sistem tidak memiliki hrm.payslip.view_all secara bawaan (K3 / HRM-FIX-12)
+        $this->assertFalse($admin->hasPermission('hrm.payslip.view_all'));
+
+        // Membuka slip gaji orang lain -> 403 + tercatat di audit log
+        $this->actingAs($admin)->get("/hrm/payslips/{$directorSlip->id}/print")->assertStatus(403);
+        $this->assertTrue(AuditLog::where('action', 'IDOR_BLOCKED')->where('document_number', $directorSlip->payslip_number)->exists());
+
+        // Halaman /hrm bagi Admin Sistem tidak memuat payrollRuns dan menyembunyikan base_salary karyawan lain
+        $hrmRes = $this->actingAs($admin)->get('/hrm');
+        $hrmRes->assertStatus(200);
+        $hrmProps = $hrmRes->viewData('page')['props'];
+        $this->assertEmpty($hrmProps['payrollRuns']);
+        if (! empty($hrmProps['employees'])) {
+            $this->assertArrayNotHasKey('base_salary', $hrmProps['employees'][0]);
+        }
     }
 
     /**
@@ -157,3 +185,4 @@ class HrmPortalFixTest extends TestCase
         $resQuota->assertSessionHasErrors('end_date');
     }
 }
+

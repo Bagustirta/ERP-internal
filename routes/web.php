@@ -91,6 +91,7 @@ Route::middleware('auth')->group(function () {
 
     // Portal Karyawan Self-Service (tersedia untuk seluruh pengguna yang login; data selalu dibatasi ke user_id sendiri)
     Route::get('/hrm/portal', [HrmController::class, 'portal'])->name('hrm.portal');
+    Route::post('/hrm/portal/contact-hr', [HrmController::class, 'contactHrForProfile'])->name('hrm.portal.contact-hr');
     Route::post('/hrm/leaves', [HrmController::class, 'storeLeave'])->name('hrm.leaves.store');
     Route::get('/hrm/payslips/{payslip}/print', [HrmController::class, 'printPayslip'])->name('hrm.payslips.print');
 
