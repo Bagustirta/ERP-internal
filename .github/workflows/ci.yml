@@ -64,7 +64,7 @@ jobs:
 
       - name: Install Frontend Dependencies & Build Assets
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm audit --audit-level=high || true
           npm run build
 
